@@ -18,11 +18,19 @@ Siempre es un **contenedor Linux** (Ubuntu 24.04). El host solo necesita un moto
 
 | Host | Motor | Notas |
 |------|-------|-------|
-| **Mac mini (Apple Silicon, arm64)** | Podman | `brew install podman && podman machine init && podman machine start`. Usa la imagen arm64. |
+| **Mac mini (Apple Silicon, arm64)** | Podman | `brew install podman docker-compose && podman machine init && podman machine start`. Usa la imagen arm64. |
 | **Fedora (x86_64)** | Podman (o Docker) | `sudo dnf install podman podman-compose`. Nativo amd64. |
-| **Windows (x86_64)** | Podman Desktop o Docker Desktop | Backend **WSL2**. Ejecuta `deploy.sh` en **Git Bash** o en la shell de **WSL2** (no PowerShell). Corre la imagen amd64 como contenedor Linux. |
+| **Windows (x86_64)** | Podman Desktop o Docker Desktop | Backend **WSL2**. Ejecuta `deploy.sh` en **Git Bash**/**WSL2**, o `deploy.ps1` en **PowerShell**. Corre la imagen amd64 como contenedor Linux. |
 
 `deploy.sh` es un script POSIX `sh`; necesita `curl` en el host (y `jq` opcional, solo para un mensaje de error más claro al validar el token).
+
+> **Podman no incluye `compose`**: necesita un proveedor externo — `podman-compose` (`pip3 install podman-compose` o el paquete de tu distro) o el binario `docker-compose` (`brew install docker-compose`; en Windows suele venir con Docker Desktop). Si ves `falta un proveedor de compose para podman`, instala uno. `deploy.sh`/`deploy.ps1` autodetectan el motor: prefieren Podman con compose y, si Podman no tiene proveedor, **caen a Docker**; puedes forzarlo con `--engine`/`-Engine podman|docker`.
+>
+> Cuando Podman usa un proveedor externo imprime un aviso `>>>> Executing external compose provider … <<<<` (a stderr, **inofensivo**). Para silenciarlo, en tu `containers.conf` (`~/.config/containers/containers.conf` en Linux, `%APPDATA%\containers\containers.conf` en Windows) pon:
+> ```ini
+> [engine]
+> compose_warning_logs=false
+> ```
 
 ### Windows con Git Bash
 
@@ -34,6 +42,28 @@ Siempre es un **contenedor Linux** (Ubuntu 24.04). El host solo necesita un moto
   ```
 - **Permisos:** `chmod 600` sobre `.env`/`access_token` es *best-effort* en NTFS (Windows usa ACLs), así que la protección de fichero es más débil que en Linux/macOS. Restringe el acceso a la carpeta si te preocupa.
 - **jq** no viene con Git Bash; no es necesario (`deploy.sh` funciona sin él).
+
+### Windows con PowerShell
+
+Si prefieres PowerShell nativo (sin Git Bash ni WSL2 en la shell), usa **`deploy.ps1`** — el equivalente de `deploy.sh` con parámetros al estilo PowerShell (`-Repo`, `-Token`, …). Funciona en Windows PowerShell 5.1 y PowerShell 7, con Docker Desktop (trae `docker compose`) o Podman con un proveedor de compose.
+
+Un comando (permite pasar parámetros, sin tocar la Execution Policy):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/JoseAmador95/gh_runner/main/deploy.ps1))) -Repo OWNER/REPO -Token <PAT> -Count 3 -Up
+```
+
+O descargar y ejecutar:
+
+```powershell
+irm https://raw.githubusercontent.com/JoseAmador95/gh_runner/main/deploy.ps1 -OutFile deploy.ps1
+.\deploy.ps1 -Repo OWNER/REPO -Token <PAT> -Count 3 -Up
+```
+
+- Sin `-Token`, toma el PAT de `$env:ACCESS_TOKEN`, luego de `gh auth token`, y si no lo pide (oculto).
+- Mismos flags que `deploy.sh` pero con guion simple: `-Count`, `-Prefix`, `-Labels`, `-Secret`, `-Cpus`, `-Memory`, `-Engine`, `-Force`, `-NoUp`, `-Help`, etc.
+- Si `.\deploy.ps1` queda bloqueado por la Execution Policy, usa `pwsh -ExecutionPolicy Bypass -File .\deploy.ps1 …` o `Unblock-File .\deploy.ps1`.
+- **Permisos:** en NTFS restringe `.env`/`access_token` con `icacls` (best-effort), igual que en Git Bash.
 
 ---
 
@@ -121,6 +151,7 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/JoseAmador95/gh_runner/mai
 | `--labels L` | Etiquetas extra (coma) | `RUNNER_LABELS` |
 | `--group G` | Runner group | `RUNNER_GROUP` |
 | `--image REF` | Imagen (def. `ghcr.io/joseamador95/gh_runner:latest`) | `IMAGE` |
+| `--engine E` | Fuerza el motor: `podman` o `docker` (def. autodetecta) | — |
 | `--cache-dirs A,B` | Dirs extra de cache por runner (p.ej. `.npm,.cargo`) | — |
 | `--cpus N` | Límite de CPU por runner (p.ej. `2`, `1.5`) | `RUNNER_CPUS` |
 | `--memory SIZE` | Límite de memoria por runner (p.ej. `2g`, `512m`) | `RUNNER_MEMORY` |

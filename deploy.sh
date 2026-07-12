@@ -58,12 +58,13 @@ CPUS=""             # límite de CPU por runner
 MEMORY=""           # límite de memoria por runner
 USE_SECRET="no"     # --secret: PAT como file-secret en vez de en .env
 SECRET_FILE="access_token"
+ENGINE_PREF=""      # --engine: forzar podman o docker
 
 # ---- Utilidades ------------------------------------------------------------
 err()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 info() { printf '%s\n' "$*" >&2; }
 
-MARKER="# GENERADO por deploy.sh"
+MARKER="# GENERADO por deploy"   # prefijo común con deploy.ps1 (reconocimiento cruzado)
 
 # No pisar un compose.yaml/.env que no generó deploy.sh (nombres genéricos).
 guard_overwrite() {
@@ -102,6 +103,8 @@ Despliegue:
                          self-hosted, Linux y la arquitectura)
   --group G              Runner group (opcional)
   --image REF            Imagen del contenedor (por defecto ghcr.io/joseamador95/gh_runner:latest)
+  --engine E             Fuerza el motor: podman o docker (por defecto: autodetecta,
+                         prefiere podman con compose y si no cae a docker)
   --cache-dirs A,B       Dirs extra de cache por runner (p.ej. .npm,.cargo);
                          relativas a /home/runner o absolutas
   --cpus N               Límite de CPU por runner (p.ej. 2 o 1.5)
@@ -142,6 +145,7 @@ while [ "$#" -gt 0 ]; do
         --labels)      LABELS="${2:?}"; shift 2 ;;
         --group)       GROUP="${2:?}"; shift 2 ;;
         --image)       IMAGE="${2:?}"; shift 2 ;;
+        --engine)      ENGINE_PREF="${2:?}"; shift 2 ;;
         --cache-dirs)  CACHE_DIRS_CSV="${2:?}"; shift 2 ;;
         --cpus)        CPUS="${2:?}"; shift 2 ;;
         --memory)      MEMORY="${2:?}"; shift 2 ;;
@@ -217,29 +221,47 @@ case "$COUNT" in ''|*[!0-9]*) err "--count debe ser un entero positivo" ;; esac
 [ "$COUNT" -ge 1 ] || err "--count debe ser >= 1"
 
 # ---- Detección de motor y compose -----------------------------------------
-if command -v podman >/dev/null 2>&1; then
-    ENGINE="podman"
-elif command -v docker >/dev/null 2>&1; then
-    ENGINE="docker"
-else
-    err "no se encontró 'podman' ni 'docker' en el PATH"
-fi
+case "$ENGINE_PREF" in ''|podman|docker) : ;; *) err "--engine debe ser podman o docker" ;; esac
 
-if [ "$ENGINE" = "podman" ]; then
-    if podman compose version >/dev/null 2>&1; then
-        COMPOSE="podman compose"
-    elif command -v podman-compose >/dev/null 2>&1; then
-        COMPOSE="podman-compose"
-    else
-        err "falta un proveedor de compose para podman ('podman compose' o 'podman-compose')"
+# Devuelve el comando de compose para el motor $1, o nada si no hay proveedor.
+compose_for() {
+    case "$1" in
+        podman)
+            if podman compose version >/dev/null 2>&1; then printf 'podman compose'
+            elif command -v podman-compose >/dev/null 2>&1; then printf 'podman-compose'
+            fi ;;
+        docker)
+            if docker compose version >/dev/null 2>&1; then printf 'docker compose'
+            elif command -v docker-compose >/dev/null 2>&1; then printf 'docker-compose'
+            fi ;;
+    esac
+}
+
+# Prefiere el motor forzado con --engine; si no, podman y luego docker. Se elige
+# el primero que tenga un proveedor de compose funcionando.
+_engines="${ENGINE_PREF:-podman docker}"
+ENGINE=""; COMPOSE=""
+# shellcheck disable=SC2086
+for _eng in $_engines; do
+    command -v "$_eng" >/dev/null 2>&1 || continue
+    _c="$(compose_for "$_eng")"
+    if [ -n "$_c" ]; then ENGINE="$_eng"; COMPOSE="$_c"; break; fi
+done
+
+if [ -z "$ENGINE" ]; then
+    if [ -n "$ENGINE_PREF" ] && ! command -v "$ENGINE_PREF" >/dev/null 2>&1; then
+        err "--engine $ENGINE_PREF: no se encontró '$ENGINE_PREF' en el PATH"
     fi
-else
-    if docker compose version >/dev/null 2>&1; then
-        COMPOSE="docker compose"
-    elif command -v docker-compose >/dev/null 2>&1; then
-        COMPOSE="docker-compose"
+    if command -v podman >/dev/null 2>&1 || command -v docker >/dev/null 2>&1; then
+        err "hay motor de contenedores pero falta un proveedor de compose. Instala uno:
+       - Podman (no trae compose integrado):
+           macOS:   brew install docker-compose      (o: pip3 install podman-compose)
+           Fedora:  sudo dnf install podman-compose
+           Windows: activa Compose en Podman Desktop, o instala docker-compose
+       - Docker: instala el plugin 'docker compose' (Docker Desktop ya lo trae).
+       Verifica con 'podman compose version' o 'docker compose version'."
     else
-        err "falta un proveedor de compose para docker ('docker compose' o 'docker-compose')"
+        err "no se encontró 'podman' ni 'docker' en el PATH"
     fi
 fi
 
@@ -304,7 +326,7 @@ norm_dir()   { case "$1" in /*) printf '%s' "$1" ;; *) printf '/home/runner/%s' 
 vol_suffix() { printf '%s' "$1" | tr -cd 'A-Za-z0-9'; }
 
 {
-    printf '# GENERADO por deploy.sh — no editar a mano.\n'
+    printf '%s — no editar a mano.\n' "$MARKER"
     printf '# Runners: %s | repo: %s/%s | imagen: %s\n\n' "$COUNT" "$OWNER" "$NAME" "$IMAGE"
     printf 'x-runner-common: &runner-common\n'
     printf '  image: %s\n' "$IMAGE"
