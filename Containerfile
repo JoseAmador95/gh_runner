@@ -2,11 +2,10 @@
 # Se publica multi-arch (linux/arm64 + linux/amd64) en GHCR vía
 # .github/workflows/build-image.yml; normalmente NO necesitas construirla a mano.
 #
-# Build local (arm64 nativo en la Mac):
+# Build local (detecta la arch del host automáticamente con uname -m):
 #   podman build -t gh-runner:local .
-# Build cruzada a x86_64:
+# Cross-build a otra arch (requiere emulación binfmt/qemu; más lento):
 #   podman build --platform linux/amd64 -t gh-runner:local-amd64 .
-#   (requiere una podman machine x86_64 o emulación; es más lento).
 
 FROM ubuntu:24.04
 
@@ -16,7 +15,6 @@ LABEL org.opencontainers.image.source="https://github.com/JoseAmador95/gh_runner
 # Versión del agente runner. Mínimo exigido por GitHub (enforcement 2026): 2.329.0
 # Última al momento de escribir: 2.334.0. Revisa https://github.com/actions/runner/releases
 ARG RUNNER_VERSION=2.334.0
-ARG TARGETARCH=arm64
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -35,12 +33,15 @@ RUN useradd -m -s /bin/bash runner \
 USER runner
 WORKDIR /home/runner
 
-# Descarga y descompresión del agente según la arquitectura de destino.
+# Descarga y descompresión del agente según la arquitectura REAL del build.
+# Usamos `uname -m` (no un ARG con default) para no descargar nunca el binario
+# de la arch equivocada: en un build multi-arch de buildx cada plataforma corre
+# bajo su propia emulación, así que uname refleja la arch de destino correcta.
 RUN set -eux; \
-    case "${TARGETARCH}" in \
-        arm64) ARCH=arm64 ;; \
-        amd64) ARCH=x64 ;; \
-        *) echo "Arquitectura no soportada: ${TARGETARCH}" && exit 1 ;; \
+    case "$(uname -m)" in \
+        x86_64 | amd64)   ARCH=x64 ;; \
+        aarch64 | arm64)  ARCH=arm64 ;; \
+        *) echo "Arquitectura no soportada: $(uname -m)" >&2 && exit 1 ;; \
     esac; \
     curl -fsSL -o runner.tar.gz \
         "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${ARCH}-${RUNNER_VERSION}.tar.gz"; \
