@@ -1,14 +1,17 @@
-# Runner de GitHub Actions autohospedado sobre Ubuntu 24.04
-# Pensado para Apple Silicon (arm64) ejecutado con Podman rootless.
+# Runner de GitHub Actions autohospedado sobre Ubuntu 24.04.
+# Se publica multi-arch (linux/arm64 + linux/amd64) en GHCR vía
+# .github/workflows/build-image.yml; normalmente NO necesitas construirla a mano.
 #
-# Build (desde la Mac, arm64 nativo):
-#   podman build -t gh-runner:u24 .
-#
-# Si algún día necesitas la MISMA arquitectura que ubuntu-24.04 de GitHub (x86_64),
-# construye con:  podman build --platform linux/amd64 -t gh-runner:u24-amd64 .
-# (requiere una podman machine x86_64 o emulación; es mucho más lento).
+# Build local (arm64 nativo en la Mac):
+#   podman build -t gh-runner:local .
+# Build cruzada a x86_64:
+#   podman build --platform linux/amd64 -t gh-runner:local-amd64 .
+#   (requiere una podman machine x86_64 o emulación; es más lento).
 
 FROM ubuntu:24.04
+
+# Enlaza el package publicado en GHCR con este repositorio (visibilidad/procedencia).
+LABEL org.opencontainers.image.source="https://github.com/JoseAmador95/gh_runner"
 
 # Versión del agente runner. Mínimo exigido por GitHub (enforcement 2026): 2.329.0
 # Última al momento de escribir: 2.334.0. Revisa https://github.com/actions/runner/releases
@@ -45,8 +48,13 @@ RUN set -eux; \
     rm runner.tar.gz
 
 # installdependencies.sh necesita root (apt). Lo ejecutamos y volvemos a runner.
+# Además pre-creamos _work y .cache con dueño runner: al montar volúmenes
+# nombrados (Podman rootless) el mountpoint conserva ese dueño en vez de root,
+# lo que evita que actions/checkout falle por permisos.
 USER root
-RUN /home/runner/bin/installdependencies.sh
+RUN /home/runner/bin/installdependencies.sh \
+    && mkdir -p /home/runner/_work /home/runner/.cache \
+    && chown -R runner:runner /home/runner/_work /home/runner/.cache
 USER runner
 
 COPY --chown=runner:runner entrypoint.sh /home/runner/entrypoint.sh

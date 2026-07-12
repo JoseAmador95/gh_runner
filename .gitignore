@@ -1,0 +1,10 @@
+# Secreto: contiene el PAT (ACCESS_TOKEN). NUNCA se commitea.
+.env
+.env.*
+
+# Compose generado por deploy.sh (específico de cada máquina).
+gh-runner.compose.yaml
+
+# Datos locales del runner / logs.
+_work/
+*.log
