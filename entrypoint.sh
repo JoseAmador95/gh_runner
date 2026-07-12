@@ -45,33 +45,90 @@ for _d in /home/runner/_work /home/runner/.cache ${CACHE_DIRS:-}; do
     [ -O "$_d" ] || sudo chown runner:runner "$_d" 2>/dev/null || true
 done
 
+# ---- Backoff anti crash-loop (protege el rate limit de GitHub) -------------
+# Cada arranque mintea un registration-token. Si el contenedor falla y
+# restart:always lo relanza al instante, eso martillearía la API de GitHub y
+# dispararía el rate limit. Distinguimos un ciclo SANO (marca .ok al terminar)
+# de un crash-loop (fallo rápido sin .ok) y, en éste, esperamos con backoff
+# exponencial. Los ficheros persisten entre restarts del mismo contenedor.
+_ok="/home/runner/.gh_runner_ok"
+_stamp="/home/runner/.gh_runner_last"
+_fails="/home/runner/.gh_runner_fails"
+_min_cycle=20
+_now="$(date +%s)"
+if [ -f "$_ok" ]; then
+    rm -f "$_ok" "$_fails"          # el ciclo anterior terminó sano
+elif [ -f "$_stamp" ]; then
+    _last="$(cat "$_stamp" 2>/dev/null || echo 0)"
+    case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+    _delta=$(( _now - _last ))
+    if [ "$_delta" -ge 0 ] && [ "$_delta" -lt "$_min_cycle" ]; then
+        _n="$(cat "$_fails" 2>/dev/null || echo 0)"
+        case "$_n" in ''|*[!0-9]*) _n=0 ;; esac
+        _n=$(( _n + 1 )); echo "$_n" > "$_fails"
+        if [ "$_n" -ge 5 ]; then _back=300; else _back=$(( 15 * (1 << (_n - 1)) )); fi
+        _back=$(( _back + (RANDOM % 10) ))
+        echo "Fallo rápido (#${_n}, ciclo previo ${_delta}s); esperando ${_back}s para no exceder el rate limit de GitHub..." >&2
+        sleep "$_back"
+    fi
+fi
+date +%s > "$_stamp"
+
 # ---------------------------------------------------------------------------
-# mint_token <registration-token|remove-token>
+# mint_token <registration-token|remove-token> [max_reintentos]
 # Genera un token corto usando el PAT. Imprime SOLO el token por stdout; los
 # errores van por stderr. No filtra el PAT ni el cuerpo completo a los logs.
 # ---------------------------------------------------------------------------
 mint_token() {
-    local kind="$1" http body token tmp
-    tmp="$(mktemp)"
-    http="$(curl -sSL -o "$tmp" -w '%{http_code}' \
-        -X POST \
-        -H "Accept: application/vnd.github+json" \
-        -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        "${API}/repos/${REPO_USER}/${REPO_NAME}/actions/runners/${kind}" \
-        2>/dev/null || true)"
-    body="$(cat "$tmp")"; rm -f "$tmp"
-    if [ "$http" != "201" ] && [ "$http" != "200" ]; then
+    local kind="$1" max="${2:-4}" attempt=0 http body token tmp hdr retry reset remain
+    while :; do
+        tmp="$(mktemp)"; hdr="$(mktemp)"
+        http="$(curl -sSL -D "$hdr" -o "$tmp" -w '%{http_code}' \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${API}/repos/${REPO_USER}/${REPO_NAME}/actions/runners/${kind}" \
+            2>/dev/null || true)"
+        body="$(cat "$tmp")"
+
+        if [ "$http" = "201" ] || [ "$http" = "200" ]; then
+            token="$(printf '%s' "$body" | jq -r '.token // empty')"
+            rm -f "$tmp" "$hdr"
+            if [ -z "$token" ]; then echo "ERROR: sin token en la respuesta de ${kind}." >&2; return 1; fi
+            printf '%s' "$token"; return 0
+        fi
+
+        # ¿Rate limit? 429, o 403 con x-ratelimit-remaining:0 o con Retry-After.
+        remain="$(grep -i '^x-ratelimit-remaining:' "$hdr" | tail -1 | tr -dc '0-9')"
+        if [ "$http" = "429" ] \
+           || { [ "$http" = "403" ] && [ "${remain:-1}" = "0" ]; } \
+           || { [ "$http" = "403" ] && grep -qi '^retry-after:' "$hdr"; }; then
+            retry="$(grep -i '^retry-after:' "$hdr" | tail -1 | tr -dc '0-9')"
+            if [ -z "$retry" ]; then
+                reset="$(grep -i '^x-ratelimit-reset:' "$hdr" | tail -1 | tr -dc '0-9')"
+                [ -n "$reset" ] && retry=$(( reset - $(date +%s) ))
+            fi
+            case "$retry" in ''|*[!0-9]*) retry=$(( (attempt + 1) * 15 )) ;; esac
+            [ "$retry" -lt 1 ] && retry=15
+            [ "$retry" -gt 300 ] && retry=300
+            rm -f "$tmp" "$hdr"
+            if [ "$attempt" -ge "$max" ]; then
+                echo "ERROR: rate limit de GitHub persistente en ${kind}; me rindo tras ${attempt} reintento(s)." >&2
+                return 1
+            fi
+            attempt=$(( attempt + 1 ))
+            echo "Rate limit de GitHub (HTTP ${http}); reintento ${attempt}/${max} en ${retry}s..." >&2
+            sleep "$retry"
+            continue
+        fi
+
+        # Error real (no rate limit): no reintentar.
         echo "ERROR: la API de GitHub (${kind}) devolvió HTTP ${http:-000}." >&2
         echo "  $(printf '%s' "$body" | jq -r '.message // "sin mensaje"' 2>/dev/null)" >&2
+        rm -f "$tmp" "$hdr"
         return 1
-    fi
-    token="$(printf '%s' "$body" | jq -r '.token // empty')"
-    if [ -z "$token" ]; then
-        echo "ERROR: no vino ningún token en la respuesta de ${kind}." >&2
-        return 1
-    fi
-    printf '%s' "$token"
+    done
 }
 
 # ---- Leer un secret de fichero con fallback a sudo -------------------------
@@ -128,7 +185,7 @@ deregister() {
     echo "Desregistrando el runner (si sigue registrado)..." >&2
     if [ -n "${ACCESS_TOKEN:-}" ]; then
         local rt
-        rt="$(mint_token remove-token 2>/dev/null || true)"
+        rt="$(mint_token remove-token 0 2>/dev/null || true)"   # sin reintentos: no demorar el stop
         [ -n "$rt" ] && ./config.sh remove --token "$rt" >/dev/null 2>&1 || true
     else
         # Con RUNNER_TOKEN legacy no se puede mintear un remove-token; se intenta
@@ -167,4 +224,7 @@ done
 # Solo desregistramos si nos pararon estando idle. En el camino efímero normal
 # run.sh ya salió (el runner se auto-desregistró) y esto no se ejecuta.
 [ "$_terminating" = "1" ] && deregister
+
+# Marca el ciclo como SANO: el siguiente arranque no aplicará backoff.
+: > "$_ok" 2>/dev/null || true
 exit 0
