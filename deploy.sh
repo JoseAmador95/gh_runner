@@ -18,8 +18,17 @@
 # comandos del contenedor (invisible en `ps`). El compose se escribe en
 # ./compose.yaml (nombre estándar -> `podman compose` funciona sin -f).
 # Ejecuta esto en un directorio DEDICADO (genera compose.yaml y .env ahí).
+#
+# Windows: funciona en Git Bash (con Docker/Podman Desktop, backend WSL2). El
+# CLI docker.exe/podman.exe se invoca desde Git Bash sin problema.
 # ============================================================================
 set -eu
+
+# En Git Bash / MSYS2 (Windows), evita que se conviertan rutas estilo Unix
+# (p.ej. /home/runner) al pasarlas a docker.exe/podman.exe. Inofensivo fuera de
+# Windows: estas variables se ignoran en Linux/macOS.
+export MSYS_NO_PATHCONV=1
+export MSYS2_ARG_CONV_EXCL='*'
 
 # ---- Valores por defecto ---------------------------------------------------
 IMAGE_DEFAULT="ghcr.io/joseamador95/gh_runner:latest"

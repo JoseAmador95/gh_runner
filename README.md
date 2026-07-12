@@ -20,9 +20,20 @@ Siempre es un **contenedor Linux** (Ubuntu 24.04). El host solo necesita un moto
 |------|-------|-------|
 | **Mac mini (Apple Silicon, arm64)** | Podman | `brew install podman && podman machine init && podman machine start`. Usa la imagen arm64. |
 | **Fedora (x86_64)** | Podman (o Docker) | `sudo dnf install podman podman-compose`. Nativo amd64. |
-| **Windows (x86_64)** | Podman Desktop o Docker Desktop | Backend **WSL2**. Ejecuta `deploy.sh` **dentro de la shell de WSL2** (no PowerShell). Corre la imagen amd64 como contenedor Linux. |
+| **Windows (x86_64)** | Podman Desktop o Docker Desktop | Backend **WSL2**. Ejecuta `deploy.sh` en **Git Bash** o en la shell de **WSL2** (no PowerShell). Corre la imagen amd64 como contenedor Linux. |
 
-`deploy.sh` es un script POSIX `sh`; necesita `curl` y `jq` en el host para validar el token (opcional).
+`deploy.sh` es un script POSIX `sh`; necesita `curl` en el host (y `jq` opcional, solo para un mensaje de error más claro al validar el token).
+
+### Windows con Git Bash
+
+`deploy.sh` corre en **Git Bash** tal cual: el CLI `docker.exe`/`podman.exe` (Docker/Podman Desktop, backend WSL2) se invoca desde Git Bash sin problema, y el script ya desactiva la conversión de rutas de MSYS2. Ten en cuenta:
+
+- **Comandos con rutas absolutas del contenedor** (p.ej. `exec … /run/secrets/…` o `/home/runner/…`): Git Bash intenta convertir esas rutas a rutas de Windows. Antepón `MSYS_NO_PATHCONV=1` o usa doble barra (`//run/secrets/…`):
+  ```bash
+  MSYS_NO_PATHCONV=1 docker compose exec runner-1 cat /run/secrets/access_token
+  ```
+- **Permisos:** `chmod 600` sobre `.env`/`access_token` es *best-effort* en NTFS (Windows usa ACLs), así que la protección de fichero es más débil que en Linux/macOS. Restringe el acceso a la carpeta si te preocupa.
+- **jq** no viene con Git Bash; no es necesario (`deploy.sh` funciona sin él).
 
 ---
 
