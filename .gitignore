@@ -3,7 +3,8 @@
 .env.*
 
 # Compose generado por deploy.sh (específico de cada máquina).
-gh-runner.compose.yaml
+compose.yaml
+compose.yml
 
 # Datos locales del runner / logs.
 _work/

@@ -16,7 +16,8 @@
 #
 # El PAT se guarda en ./.env (chmod 600) y NUNCA se pasa por la línea de
 # comandos del contenedor (invisible en `ps`). El compose se escribe en
-# ./gh-runner.compose.yaml.
+# ./compose.yaml (nombre estándar -> `podman compose` funciona sin -f).
+# Ejecuta esto en un directorio DEDICADO (genera compose.yaml y .env ahí).
 # ============================================================================
 set -eu
 
@@ -37,16 +38,31 @@ COUNT=""
 LABELS=""
 GROUP=""
 IMAGE=""
-COMPOSE_FILE="gh-runner.compose.yaml"
+COMPOSE_FILE="compose.yaml"   # nombre autodetectado -> permite usar `podman compose` sin -f
 ENV_FILE=".env"
 CACHE_DIRS_CSV=""
 PULL_ALWAYS="no"
 DO_UP="auto"        # auto|yes|no
 SKIP_VALIDATION="no"
+FORCE="no"          # sobreescribir compose.yaml/.env ajenos
 
 # ---- Utilidades ------------------------------------------------------------
 err()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 info() { printf '%s\n' "$*" >&2; }
+
+MARKER="# GENERADO por deploy.sh"
+
+# No pisar un compose.yaml/.env que no generó deploy.sh (nombres genéricos).
+guard_overwrite() {
+    [ -e "$1" ] || return 0
+    case "$(head -n1 "$1" 2>/dev/null || true)" in
+        "$MARKER"*) return 0 ;;   # es nuestro -> se puede sobreescribir
+    esac
+    [ "$FORCE" = "yes" ] && return 0
+    err "ya existe '$1' y no lo generó deploy.sh.
+       Corre deploy.sh en un directorio DEDICADO (recomendado), usa --file OTRO.yaml,
+       o --force para sobreescribir."
+}
 
 usage() {
     cat >&2 <<'EOF'
@@ -69,12 +85,14 @@ Despliegue:
   --cache-dirs A,B       Dirs extra de cache por runner (p.ej. .npm,.cargo);
                          relativas a /home/runner o absolutas
   --pull-always          Añade pull_policy: always al compose
-  --file PATH            Ruta del compose a generar (por defecto gh-runner.compose.yaml)
+  --file PATH            Ruta del compose a generar (por defecto compose.yaml, que
+                         'podman compose' autodetecta sin -f)
 
 Ejecución:
   --up                   Levanta el stack tras generar el compose
   --no-up                No lo levanta (solo genera los ficheros)
   --skip-validation      No validar el token contra la API antes de escribir
+  --force                Sobreescribe compose.yaml/.env aunque no los generara deploy.sh
   -h, --help             Esta ayuda
 
 Variables de entorno usadas como fallback:
@@ -102,6 +120,7 @@ while [ "$#" -gt 0 ]; do
         --up)          DO_UP="yes"; shift ;;
         --no-up)       DO_UP="no"; shift ;;
         --skip-validation) SKIP_VALIDATION="yes"; shift ;;
+        --force)       FORCE="yes"; shift ;;
         -h|--help)     usage 0 ;;
         *) err "opción desconocida: $1 (usa --help)" ;;
     esac
@@ -217,9 +236,14 @@ HOST="${HOST%%.*}"
 HOST="$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9_-' '-')"
 [ -n "$HOST" ] || HOST="runner"
 
+# ---- No pisar ficheros ajenos ---------------------------------------------
+guard_overwrite "$ENV_FILE"
+guard_overwrite "$COMPOSE_FILE"
+
 # ---- Escribir .env (config compartida; el PAT vive solo aquí) --------------
 umask 077
 {
+    printf '%s (líneas # son comentarios)\n' "$MARKER"
     printf 'ACCESS_TOKEN=%s\n' "$TOKEN"
     printf 'REPO_USER=%s\n' "$OWNER"
     printf 'REPO_NAME=%s\n' "$NAME"
@@ -308,26 +332,36 @@ info "  Imagen  : ${IMAGE}"
 info "  Token   : ${TOKEN_SRC:-desconocido}"
 info "  Motor   : ${ENGINE} (${COMPOSE})"
 
+# ---- Comandos de control ---------------------------------------------------
+# Con el nombre autodetectado (compose.yaml, etc.) no hace falta -f.
+case "$COMPOSE_FILE" in
+    compose.yaml|compose.yml|docker-compose.yaml|docker-compose.yml)
+        FILE_ARG=""; CTL="$COMPOSE" ;;
+    *)
+        FILE_ARG="-f $COMPOSE_FILE"; CTL="$COMPOSE -f $COMPOSE_FILE" ;;
+esac
+
 # ---- Levantar el stack -----------------------------------------------------
 if [ "$DO_UP" = "auto" ]; then
     if [ -t 0 ]; then DO_UP="yes"; else DO_UP="no"; fi
 fi
 
-UP_CMD="$COMPOSE -f $COMPOSE_FILE up -d"
 if [ "$DO_UP" = "yes" ]; then
     info ""
-    info "Levantando: $UP_CMD"
+    info "Levantando: $CTL up -d"
     # shellcheck disable=SC2086
-    $COMPOSE -f "$COMPOSE_FILE" up -d
+    $COMPOSE $FILE_ARG up -d
     info ""
-    info "Listo. Comprueba con: $ENGINE ps"
+    info "Listo. Comprueba con: $CTL ps"
 else
     info ""
     info "Para levantar los runners:"
-    info "  $UP_CMD"
+    info "  $CTL up -d"
 fi
 
 info ""
-info "Teardown:"
-info "  $COMPOSE -f $COMPOSE_FILE down       # para y desregistra"
-info "  $COMPOSE -f $COMPOSE_FILE down -v    # + borra el cache (volúmenes)"
+info "Comandos útiles (desde este directorio):"
+info "  $CTL ps                 # estado"
+info "  $CTL logs -f runner-1   # logs de un runner"
+info "  $CTL down               # parar y desregistrar"
+info "  $CTL down -v            # + borrar el cache (volúmenes)"

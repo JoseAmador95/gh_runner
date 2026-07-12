@@ -89,10 +89,12 @@ export REPO_USER=JoseAmador95 REPO_NAME=mi-repo
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/JoseAmador95/gh_runner/main/deploy.sh)" -- --count 3 --up
 ```
 
-`deploy.sh` genera dos ficheros en el directorio actual:
+`deploy.sh` genera dos ficheros **en el directorio actual**:
 
 - **`.env`** (permisos `600`, en `.gitignore`) — contiene el PAT y la config compartida.
-- **`gh-runner.compose.yaml`** — el compose con N servicios.
+- **`compose.yaml`** — el compose con N servicios. Se llama así (nombre estándar) para que puedas usar `podman compose …` **sin `-f`**.
+
+> 💡 **Corre `deploy.sh` en un directorio dedicado** (p.ej. `mkdir ~/gh-runner && cd ~/gh-runner`), porque escribe `compose.yaml` y `.env` ahí. Si ya existe un `compose.yaml`/`.env` que **no** generó `deploy.sh`, se niega a pisarlo (usa `--force` para forzar).
 
 ---
 
@@ -110,16 +112,71 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/JoseAmador95/gh_runner/mai
 | `--image REF` | Imagen (def. `ghcr.io/joseamador95/gh_runner:latest`) | `IMAGE` |
 | `--cache-dirs A,B` | Dirs extra de cache por runner (p.ej. `.npm,.cargo`) | — |
 | `--pull-always` | Añade `pull_policy: always` al compose | — |
-| `--file PATH` | Ruta del compose a generar | — |
+| `--file PATH` | Ruta del compose a generar (def. `compose.yaml`) | — |
 | `--up` / `--no-up` | Levantar o no el stack tras generar | — |
 | `--skip-validation` | No validar el token contra la API | — |
+| `--force` | Sobreescribe `compose.yaml`/`.env` ajenos | — |
 | `-h`, `--help` | Ayuda | — |
 
 > GitHub añade **automáticamente** las etiquetas `self-hosted`, `Linux` y la arquitectura (`X64`/`ARM64`). `--labels` es solo para etiquetas **extra** (p.ej. `gpu`, `mi-proyecto`).
 
 ---
 
-## 4. Varios runners y varias máquinas
+## 4. Operación diaria (interactuar con los runners)
+
+`deploy.sh` es solo el arranque. Después interactúas con **compose** desde el directorio donde están `compose.yaml` y `.env`.
+
+**Usarlos** (el objetivo real): no "entras" a los runners; los apuntas desde tus workflows y los ves en **repo → Settings → Actions → Runners**.
+
+```yaml
+jobs:
+  build:
+    runs-on: [self-hosted, linux, ARM64]   # o las labels que definiste
+```
+
+**Comandos** (con `compose.yaml` no hace falta `-f`):
+
+| Acción | Comando |
+|--------|---------|
+| Levantar / aplicar cambios | `podman compose up -d` |
+| Estado | `podman compose ps` |
+| Logs de un runner | `podman compose logs -f runner-1` |
+| Reiniciar uno | `podman compose restart runner-1` |
+| Entrar a un contenedor | `podman exec -it <nombre> bash` |
+| Parar todo (desregistra) | `podman compose down` |
+| Parar + borrar cache | `podman compose down -v` |
+
+> Con Docker sustituye `podman` por `docker`. Si usaste `--file otro.yaml`, añade `-f otro.yaml`.
+
+**Escalar** (más/menos runners): vuelve a correr `deploy.sh` con otro `--count` (regenera el `compose.yaml`) y aplica:
+
+```bash
+podman compose up -d --remove-orphans   # --remove-orphans quita los que redujiste
+```
+
+**Actualizar la imagen:**
+
+```bash
+podman pull ghcr.io/joseamador95/gh_runner:latest
+podman compose up -d                     # recrea con la nueva imagen
+```
+
+(O usa `--pull-always` al generar el compose para que haga `pull` en cada `up`.)
+
+**Limpiar del todo:**
+
+```bash
+podman compose down -v          # para, desregistra y borra los volúmenes (cache)
+rm -f .env compose.yaml         # borra los ficheros generados
+```
+
+### ⚠️ Esto es normal: los contenedores se reinician
+
+Como los runners son **efímeros**, cada uno procesa **un job y su contenedor se reinicia** (por `restart: always`) para re-registrarse limpio. Así que en `podman compose ps` los verás ciclar tras cada job, y en la UI de GitHub el runner desaparece un instante y reaparece. **No es un error** — es el ciclo efímero. En reposo (sin jobs) están `Up` esperando.
+
+---
+
+## 5. Varios runners y varias máquinas
 
 - **Varios por máquina:** `--count N` crea N servicios, cada uno con su **propio** volumen de cache. Los nombres son `PREFIX-HOSTNAME-i` (únicos por índice).
 - **Varias máquinas:** corre el mismo comando en cada host. El `hostname` mantiene los nombres únicos entre máquinas. Puedes usar el mismo PAT en todas, o uno por máquina (recomendado a gran escala por los *rate limits*).
@@ -128,7 +185,7 @@ Verifica en el repo: **Settings → Actions → Runners** (aparecen como *idle*)
 
 ---
 
-## 5. Cache
+## 6. Cache
 
 Cada runner monta volúmenes **propios** (no compartidos, para evitar corrupción entre contenedores concurrentes):
 
@@ -140,7 +197,7 @@ Para **limpiar** el cache: `… down -v` (borra los volúmenes).
 
 ---
 
-## 6. Auto-reinicio y aviso sobre reinicios de la máquina
+## 7. Auto-reinicio y aviso sobre reinicios de la máquina
 
 El compose usa `restart: always`: si un contenedor se cae, el motor lo recrea, **genera un token nuevo** y se re-registra en segundos.
 
@@ -154,26 +211,7 @@ El compose usa `restart: always`: si un contenedor se cae, el motor lo recrea, *
   ```
 - **Windows:** activa *"Start on login"* en Podman/Docker Desktop y asegúrate de que la distro WSL2 arranque.
 
----
-
-## 7. Actualizar la imagen
-
-```bash
-podman pull ghcr.io/joseamador95/gh_runner:latest
-podman compose -f gh-runner.compose.yaml up -d   # recrea con la nueva imagen
-```
-
-(O usa `--pull-always` al generar el compose para que haga `pull` en cada `up`.)
-
----
-
-## 8. Teardown
-
-```bash
-podman compose -f gh-runner.compose.yaml down       # para y desregistra los runners idle
-podman compose -f gh-runner.compose.yaml down -v    # + borra los volúmenes (cache)
-rm -f .env gh-runner.compose.yaml                   # limpia los ficheros generados
-```
+> Actualizar la imagen, escalar y hacer teardown se explican en **§4 Operación diaria**.
 
 ---
 
