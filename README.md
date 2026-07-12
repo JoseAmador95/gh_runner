@@ -158,14 +158,22 @@ jobs:
 podman compose up -d --remove-orphans   # --remove-orphans quita los que redujiste
 ```
 
-**Actualizar la imagen:**
+**Actualizar la imagen (importante — leer):**
+
+El workflow `build-image.yml` reconstruye y publica `:latest` **semanalmente** (con la última versión de `actions/runner`). Pero los hosts **no** la adoptan solos:
+
+- El ciclo efímero es un **restart** (el job termina → `restart: always` reinicia el contenedor **con la misma imagen** con la que se creó). **Un restart nunca hace `pull`**, así que el runner sigue con la imagen vieja job tras job. `pull_policy: always` tampoco lo cambia: solo actúa al **recrear** (`up`), no en un restart.
+
+Para adoptar la imagen nueva hay que **recrear** los contenedores:
 
 ```bash
-podman pull ghcr.io/joseamador95/gh_runner:latest
-podman compose up -d                     # recrea con la nueva imagen
+podman compose pull      # baja el :latest nuevo de GHCR
+podman compose up -d     # recrea los contenedores con la imagen nueva
 ```
 
-(O usa `--pull-always` al generar el compose para que haga `pull` en cada `up`.)
+(Con `--pull-always` al generar el compose, basta `podman compose up -d`.)
+
+> ⚠️ `up -d` recrea **todos** los contenedores; si uno está a mitad de un job, ese job se **cancela** (el runner drena por la parada elegante, pero el job en curso se pierde). Como los jobs efímeros son cortos la ventana es pequeña — aun así, hazlo en horas tranquilas. Hacerlo cada semana (tras el rebuild) mantiene el fleet al día.
 
 **Limpiar del todo:**
 
