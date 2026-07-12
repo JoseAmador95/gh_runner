@@ -1,0 +1,14 @@
+# Normaliza saltos de línea. Los scripts DEBEN tener LF: un CRLF (edición en
+# Windows) rompe el shebang `#!/bin/sh` dentro del contenedor Linux.
+* text=auto eol=lf
+
+*.sh          text eol=lf
+deploy.sh     text eol=lf
+entrypoint.sh text eol=lf
+Containerfile text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+
+# Binarios (por si acaso).
+*.png    binary
+*.tar.gz binary

@@ -74,6 +74,26 @@ mint_token() {
     printf '%s' "$token"
 }
 
+# ---- Leer un secret de fichero con fallback a sudo -------------------------
+# Los file-secrets de compose se montan root:root 0400; el usuario 'runner' no
+# puede leerlos, así que recurrimos al sudo sin contraseña de la imagen.
+read_secret_file() {
+    local f="$1"
+    [ -f "$f" ] || return 1
+    if [ -r "$f" ]; then cat "$f"; else sudo cat "$f"; fi
+}
+
+# Si no hay ACCESS_TOKEN explícito, intentar leerlo de un fichero:
+# ACCESS_TOKEN_FILE o el secret por defecto /run/secrets/access_token.
+if [ -z "${ACCESS_TOKEN:-}" ]; then
+    _tok_file="${ACCESS_TOKEN_FILE:-/run/secrets/access_token}"
+    if _tok="$(read_secret_file "$_tok_file" 2>/dev/null)"; then
+        ACCESS_TOKEN="$(printf '%s' "$_tok" | tr -d '\r\n')"
+        export ACCESS_TOKEN
+        echo "PAT leído del secret ${_tok_file}."
+    fi
+fi
+
 # ---- Resolver el token de registro ----------------------------------------
 if [ -n "${ACCESS_TOKEN:-}" ]; then
     echo "Generando un token de registro fresco vía PAT..."
@@ -82,27 +102,40 @@ elif [ -n "${RUNNER_TOKEN:-}" ]; then
     echo "AVISO: usando RUNNER_TOKEN directo (caduca ~1h; el auto-reinicio se romperá)." >&2
     REG_TOKEN="${RUNNER_TOKEN}"
 else
-    echo "ERROR: define ACCESS_TOKEN (PAT, recomendado) o RUNNER_TOKEN (legacy)." >&2
+    echo "ERROR: define ACCESS_TOKEN, ACCESS_TOKEN_FILE, un secret access_token o RUNNER_TOKEN (legacy)." >&2
     exit 1
 fi
 
-# ---- Cleanup: solo relevante si se para estando idle/registrado ------------
-# Un runner --ephemeral se auto-desregistra tras completar su job, así que en el
-# caso normal ya no hay nada que borrar al salir. El trap cubre el paro en idle.
-cleanup() {
-    echo "Desregistrando el runner (si sigue registrado)..."
+# ---- Parada elegante + cleanup --------------------------------------------
+# Un runner --ephemeral se auto-desregistra al completar su job: en ese caso
+# run.sh sale con 0 y NO hay que borrar nada. deregister() solo aplica si nos
+# paran estando idle/registrado. Para que `podman stop` sea limpio reenviamos la
+# señal a run.sh en segundo plano; con RUNNER_MANUALLY_TRAP_SIG=1, run.sh instala
+# su propio trap y convierte SIGTERM->SIGINT hacia Runner.Listener (drenaje
+# ordenado). Sin esa variable run.sh NO reenvía la señal y el runner muere por
+# SIGKILL sin desregistrarse.
+RUNNER_PID=""
+_terminating=0
+
+forward_signal() {
+    _terminating=1
+    echo "Señal recibida: reenviando a run.sh para un apagado ordenado..." >&2
+    [ -n "$RUNNER_PID" ] && kill -TERM "$RUNNER_PID" 2>/dev/null || true
+}
+trap forward_signal INT TERM
+
+deregister() {
+    echo "Desregistrando el runner (si sigue registrado)..." >&2
     if [ -n "${ACCESS_TOKEN:-}" ]; then
         local rt
         rt="$(mint_token remove-token 2>/dev/null || true)"
-        [ -n "$rt" ] && ./config.sh remove --token "$rt" || true
+        [ -n "$rt" ] && ./config.sh remove --token "$rt" >/dev/null 2>&1 || true
     else
         # Con RUNNER_TOKEN legacy no se puede mintear un remove-token; se intenta
-        # con el mismo token (funcionará solo si aún no ha caducado).
-        ./config.sh remove --token "${REG_TOKEN}" || true
+        # con el mismo token (funciona solo si aún no ha caducado).
+        ./config.sh remove --token "${REG_TOKEN}" >/dev/null 2>&1 || true
     fi
-    exit 0
 }
-trap cleanup INT TERM
 
 # ---- Configurar (efímero: un job por registro) ----------------------------
 config_args=(
@@ -119,7 +152,19 @@ config_args=(
 
 ./config.sh "${config_args[@]}"
 
-# run.sh procesa UN job y sale con 0; en ese momento GitHub ya desregistró el
-# runner efímero. Con restart:always el contenedor vuelve a arrancar, genera un
-# token nuevo y se re-registra para el siguiente job.
-./run.sh
+# run.sh en segundo plano para poder reenviarle la señal en un `podman stop`.
+export RUNNER_MANUALLY_TRAP_SIG=1
+./run.sh &
+RUNNER_PID=$!
+
+# `wait` retorna al recibir una señal (el trap ya la reenvió a run.sh), así que
+# reintentamos hasta que run.sh termine de verdad.
+wait "$RUNNER_PID" 2>/dev/null || true
+while kill -0 "$RUNNER_PID" 2>/dev/null; do
+    wait "$RUNNER_PID" 2>/dev/null || true
+done
+
+# Solo desregistramos si nos pararon estando idle. En el camino efímero normal
+# run.sh ya salió (el runner se auto-desregistró) y esto no se ejecuta.
+[ "$_terminating" = "1" ] && deregister
+exit 0

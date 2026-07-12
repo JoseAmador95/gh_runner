@@ -45,6 +45,10 @@ PULL_ALWAYS="no"
 DO_UP="auto"        # auto|yes|no
 SKIP_VALIDATION="no"
 FORCE="no"          # sobreescribir compose.yaml/.env ajenos
+CPUS=""             # límite de CPU por runner
+MEMORY=""           # límite de memoria por runner
+USE_SECRET="no"     # --secret: PAT como file-secret en vez de en .env
+SECRET_FILE="access_token"
 
 # ---- Utilidades ------------------------------------------------------------
 err()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -62,6 +66,13 @@ guard_overwrite() {
     err "ya existe '$1' y no lo generó deploy.sh.
        Corre deploy.sh en un directorio DEDICADO (recomendado), usa --file OTRO.yaml,
        o --force para sobreescribir."
+}
+
+# El fichero del secret se lee verbatim (sin marker posible); no lo pisamos.
+guard_secret_file() {
+    [ -e "$1" ] || return 0
+    [ "$FORCE" = "yes" ] && return 0
+    err "ya existe '$1' (fichero del secret). Bórralo o usa --force para sobreescribir."
 }
 
 usage() {
@@ -84,9 +95,17 @@ Despliegue:
   --image REF            Imagen del contenedor (por defecto ghcr.io/joseamador95/gh_runner:latest)
   --cache-dirs A,B       Dirs extra de cache por runner (p.ej. .npm,.cargo);
                          relativas a /home/runner o absolutas
+  --cpus N               Límite de CPU por runner (p.ej. 2 o 1.5)
+  --memory SIZE          Límite de memoria por runner (p.ej. 2g, 512m)
   --pull-always          Añade pull_policy: always al compose
   --file PATH            Ruta del compose a generar (por defecto compose.yaml, que
                          'podman compose' autodetecta sin -f)
+
+Seguridad:
+  --secret               Guarda el PAT como file-secret (./access_token) en vez de
+                         en .env (no aparece en `podman inspect`). Requiere que el
+                         proveedor de compose soporte 'secrets:' (ver README).
+  --token-in-env         Fuerza el modo por defecto (PAT en .env).
 
 Ejecución:
   --up                   Levanta el stack tras generar el compose
@@ -97,7 +116,7 @@ Ejecución:
 
 Variables de entorno usadas como fallback:
   ACCESS_TOKEN, REPO_USER, REPO_NAME, RUNNER_PREFIX, RUNNER_COUNT,
-  RUNNER_LABELS, RUNNER_GROUP, IMAGE
+  RUNNER_LABELS, RUNNER_GROUP, IMAGE, RUNNER_CPUS, RUNNER_MEMORY
 EOF
     exit "${1:-0}"
 }
@@ -115,8 +134,12 @@ while [ "$#" -gt 0 ]; do
         --group)       GROUP="${2:?}"; shift 2 ;;
         --image)       IMAGE="${2:?}"; shift 2 ;;
         --cache-dirs)  CACHE_DIRS_CSV="${2:?}"; shift 2 ;;
+        --cpus)        CPUS="${2:?}"; shift 2 ;;
+        --memory)      MEMORY="${2:?}"; shift 2 ;;
         --pull-always) PULL_ALWAYS="yes"; shift ;;
         --file)        COMPOSE_FILE="${2:?}"; shift 2 ;;
+        --secret)      USE_SECRET="yes"; shift ;;
+        --token-in-env) USE_SECRET="no"; shift ;;
         --up)          DO_UP="yes"; shift ;;
         --no-up)       DO_UP="no"; shift ;;
         --skip-validation) SKIP_VALIDATION="yes"; shift ;;
@@ -164,6 +187,8 @@ COUNT="${COUNT:-${RUNNER_COUNT:-1}}"
 LABELS="${LABELS:-${RUNNER_LABELS:-}}"
 GROUP="${GROUP:-${RUNNER_GROUP:-}}"
 IMAGE="${IMAGE:-${ENV_IMAGE:-$IMAGE_DEFAULT}}"
+CPUS="${CPUS:-${RUNNER_CPUS:-}}"
+MEMORY="${MEMORY:-${RUNNER_MEMORY:-}}"
 
 # Token: --token -> ACCESS_TOKEN -> `gh auth token` -> prompt.
 if [ -z "$TOKEN" ]; then
@@ -239,12 +264,22 @@ HOST="$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9_-' '-')"
 # ---- No pisar ficheros ajenos ---------------------------------------------
 guard_overwrite "$ENV_FILE"
 guard_overwrite "$COMPOSE_FILE"
+if [ "$USE_SECRET" = "yes" ]; then guard_secret_file "$SECRET_FILE"; fi
 
-# ---- Escribir .env (config compartida; el PAT vive solo aquí) --------------
 umask 077
+
+# ---- (opcional) PAT como file-secret --------------------------------------
+if [ "$USE_SECRET" = "yes" ]; then
+    printf '%s' "$TOKEN" > "$SECRET_FILE"   # verbatim, sin newline ni marker
+    chmod 600 "$SECRET_FILE"
+    info "Escrito $SECRET_FILE (chmod 600) con el PAT (montado como secret)."
+fi
+
+# ---- Escribir .env (config compartida) ------------------------------------
+# En modo --secret el PAT NO va aquí (se monta como secret); el resto sí.
 {
     printf '%s (líneas # son comentarios)\n' "$MARKER"
-    printf 'ACCESS_TOKEN=%s\n' "$TOKEN"
+    [ "$USE_SECRET" = "yes" ] || printf 'ACCESS_TOKEN=%s\n' "$TOKEN"
     printf 'REPO_USER=%s\n' "$OWNER"
     printf 'REPO_NAME=%s\n' "$NAME"
     [ -n "$LABELS" ] && printf 'RUNNER_LABELS=%s\n' "$LABELS"
@@ -252,7 +287,7 @@ umask 077
     :
 } > "$ENV_FILE"
 chmod 600 "$ENV_FILE"
-info "Escrito $ENV_FILE (chmod 600) con ACCESS_TOKEN, REPO_USER, REPO_NAME."
+info "Escrito $ENV_FILE (chmod 600)."
 
 # ---- Generar el compose ----------------------------------------------------
 # Helpers para dirs de cache extra.
@@ -267,6 +302,17 @@ vol_suffix() { printf '%s' "$1" | tr -cd 'A-Za-z0-9'; }
     printf '  restart: always\n'
     [ "$PULL_ALWAYS" = "yes" ] && printf '  pull_policy: always\n'
     printf '  env_file: [%s]\n' "$ENV_FILE"
+    if [ "$USE_SECRET" = "yes" ]; then
+        printf '  secrets:\n'
+        printf '    - access_token\n'
+    fi
+    if [ -n "$CPUS" ] || [ -n "$MEMORY" ]; then
+        printf '  deploy:\n'
+        printf '    resources:\n'
+        printf '      limits:\n'
+        [ -n "$CPUS" ]   && printf '        cpus: "%s"\n' "$CPUS"
+        [ -n "$MEMORY" ] && printf '        memory: %s\n' "$MEMORY"
+    fi
     printf '\n'
     printf 'services:\n'
     i=1
@@ -320,6 +366,11 @@ vol_suffix() { printf '%s' "$1" | tr -cd 'A-Za-z0-9'; }
         fi
         i=$((i + 1))
     done
+    if [ "$USE_SECRET" = "yes" ]; then
+        printf '\nsecrets:\n'
+        printf '  access_token:\n'
+        printf '    file: ./%s\n' "$SECRET_FILE"
+    fi
 } > "$COMPOSE_FILE"
 info "Escrito $COMPOSE_FILE con $COUNT runner(s)."
 
@@ -330,6 +381,12 @@ info "  Repo    : ${OWNER}/${NAME}"
 info "  Runners : ${COUNT} (nombres: ${PREFIX}-${HOST}-1..${COUNT})"
 info "  Imagen  : ${IMAGE}"
 info "  Token   : ${TOKEN_SRC:-desconocido}"
+if [ "$USE_SECRET" = "yes" ]; then
+    info "  PAT     : file-secret (./${SECRET_FILE})"
+else
+    info "  PAT     : en ${ENV_FILE}"
+fi
+[ -n "$CPUS$MEMORY" ] && info "  Límites : cpus=${CPUS:-—} memoria=${MEMORY:-—}"
 info "  Motor   : ${ENGINE} (${COMPOSE})"
 
 # ---- Comandos de control ---------------------------------------------------

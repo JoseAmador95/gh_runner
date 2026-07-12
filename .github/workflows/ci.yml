@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # shellcheck respeta el shebang de cada script: deploy.sh (#!/bin/sh) se
+      # analiza como POSIX sh y entrypoint.sh (#!/usr/bin/env bash) como bash.
+      - uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning
+
+  hadolint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Containerfile
+          failure-threshold: error
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stub podman en el PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cat > "$RUNNER_TEMP/bin/podman" <<'STUB'
+          #!/bin/sh
+          # Stub mínimo: satisface la detección `podman compose version`.
+          if [ "$1" = "compose" ] && [ "$2" = "version" ]; then echo "stub"; exit 0; fi
+          exit 0
+          STUB
+          chmod +x "$RUNNER_TEMP/bin/podman"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Genera el compose (sin red, sin levantar)
+        run: |
+          sh ./deploy.sh --no-up --skip-validation \
+            --token FAKE --repo owner/repo --count 2 --cpus 2 --memory 2g --secret
+      - name: Valida compose.yaml (YAML + merge del anchor)
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY'
+          import yaml, sys
+          with open("compose.yaml") as f:
+              doc = yaml.safe_load(f)          # PyYAML resuelve las merge keys <<
+          svcs = doc["services"]
+          assert set(svcs) == {"runner-1", "runner-2"}, svcs
+          for name, s in svcs.items():
+              assert s.get("image"), f"{name}: image no fusionada"
+              assert s.get("restart") == "always", f"{name}: restart no fusionado"
+              assert "env_file" in s, f"{name}: env_file no fusionado"
+              assert s.get("secrets") == ["access_token"], f"{name}: secrets no fusionado"
+              assert s["deploy"]["resources"]["limits"]["cpus"] == "2", f"{name}: cpus"
+          assert doc["secrets"]["access_token"]["file"] == "./access_token"
+          print("compose.yaml OK:", list(svcs))
+          PY

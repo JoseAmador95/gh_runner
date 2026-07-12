@@ -15,6 +15,10 @@ on:
       - entrypoint.sh
       - .github/workflows/build-image.yml
   workflow_dispatch:
+  schedule:
+    # Lunes 06:00 UTC: reconstruye con la última versión de actions/runner para
+    # no quedar por debajo del mínimo que exige GitHub.
+    - cron: "0 6 * * 1"
 
 permissions:
   contents: read
@@ -54,6 +58,16 @@ jobs:
             type=sha
             type=ref,event=tag
 
+      # Resuelve la última versión de actions/runner para que cada build (sobre
+      # todo el semanal) use la más reciente. contents:read basta para el repo público.
+      - name: Resolve latest actions/runner version
+        id: runnerver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(gh release view --repo actions/runner --json tagName -q .tagName)"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -61,6 +75,8 @@ jobs:
           file: Containerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            RUNNER_VERSION=${{ steps.runnerver.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

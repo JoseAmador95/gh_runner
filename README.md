@@ -111,11 +111,15 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/JoseAmador95/gh_runner/mai
 | `--group G` | Runner group | `RUNNER_GROUP` |
 | `--image REF` | Imagen (def. `ghcr.io/joseamador95/gh_runner:latest`) | `IMAGE` |
 | `--cache-dirs A,B` | Dirs extra de cache por runner (p.ej. `.npm,.cargo`) | — |
+| `--cpus N` | Límite de CPU por runner (p.ej. `2`, `1.5`) | `RUNNER_CPUS` |
+| `--memory SIZE` | Límite de memoria por runner (p.ej. `2g`, `512m`) | `RUNNER_MEMORY` |
 | `--pull-always` | Añade `pull_policy: always` al compose | — |
 | `--file PATH` | Ruta del compose a generar (def. `compose.yaml`) | — |
+| `--secret` | Guarda el PAT como file-secret en vez de en `.env` (ver §8) | — |
+| `--token-in-env` | Fuerza el modo por defecto (PAT en `.env`) | — |
 | `--up` / `--no-up` | Levantar o no el stack tras generar | — |
 | `--skip-validation` | No validar el token contra la API | — |
-| `--force` | Sobreescribe `compose.yaml`/`.env` ajenos | — |
+| `--force` | Sobreescribe `compose.yaml`/`.env`/`access_token` ajenos | — |
 | `-h`, `--help` | Ayuda | — |
 
 > GitHub añade **automáticamente** las etiquetas `self-hosted`, `Linux` y la arquitectura (`X64`/`ARM64`). `--labels` es solo para etiquetas **extra** (p.ej. `gpu`, `mi-proyecto`).
@@ -215,6 +219,25 @@ El compose usa `restart: always`: si un contenedor se cae, el motor lo recrea, *
 
 ---
 
+## 8. Parada elegante, límites de recursos y secrets
+
+### Parada elegante
+`podman compose stop`/`down` envía SIGTERM; el contenedor lo **reenvía a `run.sh`** (que con `RUNNER_MANUALLY_TRAP_SIG=1` — puesto automáticamente — hace un apagado limpio de `Runner.Listener`) y, si el runner estaba *idle*, lo **desregistra** de GitHub antes de salir. Si un job puede estar corriendo, usa un timeout amplio: `podman compose stop -t 30`. Sin esto, un `stop` normal mataría el runner a lo bruto y quedaría *offline* en GitHub hasta que GitHub lo recolecte.
+
+### Límites de recursos (`--cpus`, `--memory`)
+Se escriben en el compose como `deploy.resources.limits`. Recomendado cuando corres **varios runners por máquina**, para que un job pesado no ahogue a los demás:
+```bash
+… deploy.sh … --count 4 --cpus 2 --memory 2g
+```
+Caveat: los honran `podman compose` (nativo), `docker compose` y un `podman-compose` **reciente**; las versiones viejas de `podman-compose` ignoran el bloque `deploy:`.
+
+### PAT como secret (`--secret`, opt-in)
+Por defecto el PAT va en `.env` (chmod 600, gitignored). Con **`--secret`**, `deploy.sh` lo guarda en `./access_token` (chmod 600, gitignored) y el compose lo monta como *file-secret* en `/run/secrets/access_token`:
+- **Beneficio:** el PAT **no** aparece en `podman inspect … .Config.Env` (con `.env` sí). Sigue en disco (`./access_token`), misma exposición que `.env`.
+- **Es opt-in a propósito:** Docker Compose ≥ 2.34 monta los file-secrets como `root:root 0400`, ilegibles por el usuario no-root `runner`; el contenedor los lee con `sudo cat` (tiene sudo sin contraseña). `podman-compose` tiene soporte parcial. Si tu proveedor de compose no soporta `secrets:`, quédate con el default (`.env`).
+
+---
+
 ## Referencia: variables del contenedor
 
 Estas las inyecta el `.env` / compose; normalmente no las tocas a mano:
@@ -222,6 +245,7 @@ Estas las inyecta el `.env` / compose; normalmente no las tocas a mano:
 | Variable | Obligatoria | Descripción |
 |----------|:-----------:|-------------|
 | `ACCESS_TOKEN` | sí* | PAT para generar tokens de registro |
+| `ACCESS_TOKEN_FILE` | no | Ruta a un fichero con el PAT (def. `/run/secrets/access_token` en modo `--secret`) |
 | `REPO_USER` | sí | Owner del repo |
 | `REPO_NAME` | sí | Nombre del repo |
 | `RUNNER_NAME` | no | Nombre del runner (def. `hostname-owner-repo`) |
@@ -230,7 +254,7 @@ Estas las inyecta el `.env` / compose; normalmente no las tocas a mano:
 | `GITHUB_API_URL` | no | Base de la API (def. `https://api.github.com`; útil en GHES) |
 | `RUNNER_TOKEN` | no | **Legacy**: token de registro directo (caduca ~1 h; rompe el auto-reinicio). Solo si no hay `ACCESS_TOKEN`. |
 
-\* `ACCESS_TOKEN` es obligatorio salvo que uses el modo legacy `RUNNER_TOKEN`.
+\* `ACCESS_TOKEN` es obligatorio salvo que lo pases como fichero (`ACCESS_TOKEN_FILE`/`--secret`) o uses el modo legacy `RUNNER_TOKEN`.
 
 ---
 
@@ -258,3 +282,10 @@ podman run -d --name gh-runner --restart=always \
     -e RUNNER_TOKEN=TOKEN \
     ghcr.io/joseamador95/gh_runner:latest
 ```
+
+---
+
+## Desarrollo y licencia
+
+- **CI:** `ci.yml` corre `shellcheck` (scripts), `hadolint` (Containerfile) y un *smoke test* de la generación del compose en cada push/PR. `build-image.yml` reconstruye y publica semanalmente con la última versión de `actions/runner`.
+- **Licencia:** [MIT](LICENSE).

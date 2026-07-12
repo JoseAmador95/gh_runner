@@ -2,6 +2,9 @@
 .env
 .env.*
 
+# Modo --secret: el PAT como file-secret. NUNCA se commitea.
+access_token
+
 # Compose generado por deploy.sh (específico de cada máquina).
 compose.yaml
 compose.yml
