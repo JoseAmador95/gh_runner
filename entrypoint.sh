@@ -32,6 +32,12 @@ REPO_URL="https://github.com/${REPO_USER}/${REPO_NAME}"
 RUNNER_NAME="${RUNNER_NAME:-$(hostname)-${REPO_USER}-${REPO_NAME}}"
 RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,ubuntu-24.04}"
 RUNNER_GROUP="${RUNNER_GROUP:-}"
+# Auto-update del runner DESACTIVADO por defecto: un self-update a mitad de job
+# cancela el job y, al ser efímero, deja config local huérfana → crash-loop (ver
+# el bloque de idempotencia más abajo). La versión se mantiene al día con el
+# rebuild diario de la imagen + pull, no con self-update en caliente. Reactívalo
+# con RUNNER_DISABLE_UPDATE=no si de verdad lo necesitas (ver README).
+RUNNER_DISABLE_UPDATE="${RUNNER_DISABLE_UPDATE:-yes}"
 
 cd /home/runner
 
@@ -194,6 +200,21 @@ deregister() {
     fi
 }
 
+# ---- Reset de config local efímera huérfana --------------------------------
+# Normalmente un runner --ephemeral borra su config local (.runner/.credentials)
+# al terminar el job. Pero si algo corta el ciclo antes (un self-update que
+# cancela el job, un crash, o "registration deleted"), run.sh sale SIN ese
+# cleanup y la config rancia se queda. Como restart:always REUSA el mismo
+# filesystem, el siguiente arranque la vería y config.sh abortaría con "already
+# configured" → crash-loop perpetuo. Borramos SOLO los ficheros de registro del
+# runner (NUNCA los marcadores .gh_runner_* del backoff); el lado servidor lo
+# reconcilia --replace (mismo RUNNER_NAME) sin gastar una llamada extra a la API.
+# rm -f es no-op en el primer arranque.
+if [ -f /home/runner/.runner ] || [ -f /home/runner/.credentials ] || [ -f /home/runner/.credentials_rsaparams ]; then
+    echo "Config local de un runner previo detectada; reseteándola para un registro limpio..." >&2
+    rm -f /home/runner/.runner /home/runner/.credentials /home/runner/.credentials_rsaparams
+fi
+
 # ---- Configurar (efímero: un job por registro) ----------------------------
 config_args=(
     --url "${REPO_URL}"
@@ -206,6 +227,11 @@ config_args=(
     --ephemeral
 )
 [ -n "${RUNNER_GROUP}" ] && config_args+=(--runnergroup "${RUNNER_GROUP}")
+# Desactiva el auto-update del runner salvo opt-in explícito (no|0|false|off).
+case "${RUNNER_DISABLE_UPDATE}" in
+    0|no|false|off) : ;;
+    *) config_args+=(--disableupdate) ;;
+esac
 
 ./config.sh "${config_args[@]}"
 

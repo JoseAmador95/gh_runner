@@ -202,7 +202,7 @@ podman compose up -d --remove-orphans   # --remove-orphans quita los que redujis
 
 **Actualizar la imagen (importante — leer):**
 
-El workflow `build-image.yml` reconstruye y publica `:latest` **semanalmente** (con la última versión de `actions/runner`). Pero los hosts **no** la adoptan solos:
+El workflow `build-image.yml` reconstruye y publica `:latest` **diariamente** (con la última versión de `actions/runner`). Pero los hosts **no** la adoptan solos:
 
 - El ciclo efímero es un **restart** (el job termina → `restart: always` reinicia el contenedor **con la misma imagen** con la que se creó). **Un restart nunca hace `pull`**, así que el runner sigue con la imagen vieja job tras job. `pull_policy: always` tampoco lo cambia: solo actúa al **recrear** (`up`), no en un restart.
 
@@ -215,7 +215,9 @@ podman compose up -d     # recrea los contenedores con la imagen nueva
 
 (Con `--pull-always` al generar el compose, basta `podman compose up -d`.)
 
-> ⚠️ `up -d` recrea **todos** los contenedores; si uno está a mitad de un job, ese job se **cancela** (el runner drena por la parada elegante, pero el job en curso se pierde). Como los jobs efímeros son cortos la ventana es pequeña — aun así, hazlo en horas tranquilas. Hacerlo cada semana (tras el rebuild) mantiene el fleet al día.
+> El runner **no** se auto-actualiza dentro del contenedor (`--disableupdate`, activado por defecto): un self-update a mitad de job cancelaría el job y, al ser efímero, podría dejar el contenedor en un crash-loop. La versión se mantiene al día con el **rebuild diario + `pull`+recreate**. Contrapartida: si GitHub sube el **mínimo** de versión de runner entre rebuilds, un runner sin actualizar podría ser rechazado hasta el siguiente `pull`+recreate (o reactívalo temporalmente con `RUNNER_DISABLE_UPDATE=no`).
+
+> ⚠️ `up -d` recrea **todos** los contenedores; si uno está a mitad de un job, ese job se **cancela** (el runner drena por la parada elegante, pero el job en curso se pierde). Como los jobs efímeros son cortos la ventana es pequeña — aun así, hazlo en horas tranquilas. Hacerlo cada día (tras el rebuild) mantiene el fleet al día.
 
 **Limpiar del todo:**
 
@@ -227,6 +229,8 @@ rm -f .env compose.yaml         # borra los ficheros generados
 ### ⚠️ Esto es normal: los contenedores se reinician
 
 Como los runners son **efímeros**, cada uno procesa **un job y su contenedor se reinicia** (por `restart: always`) para re-registrarse limpio. Así que en `podman compose ps` los verás ciclar tras cada job, y en la UI de GitHub el runner desaparece un instante y reaparece. **No es un error** — es el ciclo efímero. En reposo (sin jobs) están `Up` esperando.
+
+El runner **no** se auto-actualiza (la versión viene de la imagen; se refresca con `pull`+recreate), y el entrypoint **se auto-repara**: si al arrancar encuentra la config local de un ciclo anterior que no se limpió (p.ej. tras un corte a mitad de job), la resetea y se re-registra en vez de quedarse en `Cannot configure… already configured`.
 
 ---
 
@@ -301,6 +305,7 @@ Estas las inyecta el `.env` / compose; normalmente no las tocas a mano:
 | `RUNNER_NAME` | no | Nombre del runner (def. `hostname-owner-repo`) |
 | `RUNNER_LABELS` | no | Etiquetas extra (def. `self-hosted,ubuntu-24.04`) |
 | `RUNNER_GROUP` | no | Runner group |
+| `RUNNER_DISABLE_UPDATE` | no | Desactiva el auto-update del runner dentro del contenedor (def. `yes`). Un self-update a mitad de job cancela el job y, al ser efímero, puede dejarlo en crash-loop; la imagen ya trae la última versión (rebuild diario). Pon `no` (o `0`) para reactivar el self-update. |
 | `GITHUB_API_URL` | no | Base de la API (def. `https://api.github.com`; útil en GHES) |
 | `RUNNER_TOKEN` | no | **Legacy**: token de registro directo (caduca ~1 h; rompe el auto-reinicio). Solo si no hay `ACCESS_TOKEN`. |
 
@@ -337,5 +342,5 @@ podman run -d --name gh-runner --restart=always \
 
 ## Desarrollo y licencia
 
-- **CI:** `ci.yml` corre `shellcheck` (scripts), `hadolint` (Containerfile) y un *smoke test* de la generación del compose en cada push/PR. `build-image.yml` reconstruye y publica semanalmente con la última versión de `actions/runner`.
+- **CI:** `ci.yml` corre `shellcheck` (scripts), `hadolint` (Containerfile) y un *smoke test* de la generación del compose en cada push/PR. `build-image.yml` reconstruye y publica diariamente con la última versión de `actions/runner`.
 - **Licencia:** [MIT](LICENSE).
