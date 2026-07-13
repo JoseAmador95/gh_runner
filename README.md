@@ -155,7 +155,8 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/JoseAmador95/gh_runner/mai
 | `--cache-dirs A,B` | Dirs extra de cache por runner (p.ej. `.npm,.cargo`) | — |
 | `--cpus N` | Límite de CPU por runner (p.ej. `2`, `1.5`) | `RUNNER_CPUS` |
 | `--memory SIZE` | Límite de memoria por runner (p.ej. `2g`, `512m`) | `RUNNER_MEMORY` |
-| `--pull-always` | Añade `pull_policy: always` al compose | — |
+| `--pull-always` | *(default)* `pull_policy: always`: cada `up -d` re-baja `:latest` | — |
+| `--no-pull-always` | Desactiva `pull_policy: always` (fija la imagen local cacheada) | — |
 | `--file PATH` | Ruta del compose a generar (def. `compose.yaml`) | — |
 | `--secret` | Guarda el PAT como file-secret en vez de en `.env` (ver §8) | — |
 | `--token-in-env` | Fuerza el modo por defecto (PAT en `.env`) | — |
@@ -202,18 +203,15 @@ podman compose up -d --remove-orphans   # --remove-orphans quita los que redujis
 
 **Actualizar la imagen (importante — leer):**
 
-El workflow `build-image.yml` reconstruye y publica `:latest` **diariamente** (con la última versión de `actions/runner`). Pero los hosts **no** la adoptan solos:
-
-- El ciclo efímero es un **restart** (el job termina → `restart: always` reinicia el contenedor **con la misma imagen** con la que se creó). **Un restart nunca hace `pull`**, así que el runner sigue con la imagen vieja job tras job. `pull_policy: always` tampoco lo cambia: solo actúa al **recrear** (`up`), no en un restart.
-
-Para adoptar la imagen nueva hay que **recrear** los contenedores:
+El workflow `build-image.yml` reconstruye y publica `:latest` **diariamente** (con la última versión de `actions/runner`). `deploy.sh` genera el compose con **`pull_policy: always` por defecto**, así que adoptar la imagen nueva es un solo comando:
 
 ```bash
-podman compose pull      # baja el :latest nuevo de GHCR
-podman compose up -d     # recrea los contenedores con la imagen nueva
+podman compose up -d     # re-baja :latest (pull_policy: always) y recrea los contenedores
 ```
 
-(Con `--pull-always` al generar el compose, basta `podman compose up -d`.)
+- ⚠️ Un **restart** (el ciclo efímero, por `restart: always`) **nunca hace `pull`**: reusa la imagen con la que se creó el contenedor. Solo un **recrear** (`up -d`) adopta la imagen nueva — y con `pull_policy: always` ese `up -d` primero re-baja `:latest`. Este default es justo lo que evita quedarte con una imagen vieja cacheada (incluida una de arquitectura equivocada).
+- Si generaste el compose con `--no-pull-always`, actualiza en dos pasos: `podman compose pull && podman compose up -d`.
+- ¿Sospechas de una imagen local vieja/rota? Fuérzala: `podman compose down && podman rmi -f ghcr.io/joseamador95/gh_runner:latest && podman compose pull && podman compose up -d`.
 
 > El runner **no** se auto-actualiza dentro del contenedor (`--disableupdate`, activado por defecto): un self-update a mitad de job cancelaría el job y, al ser efímero, podría dejar el contenedor en un crash-loop. La versión se mantiene al día con el **rebuild diario + `pull`+recreate**. Contrapartida: si GitHub sube el **mínimo** de versión de runner entre rebuilds, un runner sin actualizar podría ser rechazado hasta el siguiente `pull`+recreate (o reactívalo temporalmente con `RUNNER_DISABLE_UPDATE=no`).
 

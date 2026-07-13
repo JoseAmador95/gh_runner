@@ -50,7 +50,7 @@ IMAGE=""
 COMPOSE_FILE="compose.yaml"   # nombre autodetectado -> permite usar `podman compose` sin -f
 ENV_FILE=".env"
 CACHE_DIRS_CSV=""
-PULL_ALWAYS="no"
+PULL_ALWAYS="yes"   # default: pull_policy: always (cada up -d re-baja :latest; opt-out --no-pull-always)
 DO_UP="auto"        # auto|yes|no
 SKIP_VALIDATION="no"
 FORCE="no"          # sobreescribir compose.yaml/.env ajenos
@@ -109,7 +109,8 @@ Despliegue:
                          relativas a /home/runner o absolutas
   --cpus N               Límite de CPU por runner (p.ej. 2 o 1.5)
   --memory SIZE          Límite de memoria por runner (p.ej. 2g, 512m)
-  --pull-always          Añade pull_policy: always al compose
+  --pull-always          (default) pull_policy: always: cada 'up -d' re-baja :latest
+  --no-pull-always       Quita pull_policy: always (fija la imagen local cacheada)
   --file PATH            Ruta del compose a generar (por defecto compose.yaml, que
                          'podman compose' autodetecta sin -f)
 
@@ -150,6 +151,7 @@ while [ "$#" -gt 0 ]; do
         --cpus)        CPUS="${2:?}"; shift 2 ;;
         --memory)      MEMORY="${2:?}"; shift 2 ;;
         --pull-always) PULL_ALWAYS="yes"; shift ;;
+        --no-pull-always) PULL_ALWAYS="no"; shift ;;
         --file)        COMPOSE_FILE="${2:?}"; shift 2 ;;
         --secret)      USE_SECRET="yes"; shift ;;
         --token-in-env) USE_SECRET="no"; shift ;;
