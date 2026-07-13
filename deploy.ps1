@@ -38,6 +38,7 @@ param(
     [string]$Cpus,
     [string]$Memory,
     [switch]$PullAlways,
+    [switch]$NoPullAlways,
     [string]$File = 'compose.yaml',
     [switch]$Secret,
     [switch]$Up,
@@ -85,7 +86,8 @@ Despliegue:
   -CacheDirs A,B         Dirs extra de cache por runner (p.ej. .npm,.cargo)
   -Cpus N                Límite de CPU por runner (p.ej. 2)
   -Memory SIZE           Límite de memoria por runner (p.ej. 2g)
-  -PullAlways            Añade pull_policy: always al compose
+  -PullAlways            (default) pull_policy: always: cada 'up -d' re-baja :latest
+  -NoPullAlways          Quita pull_policy: always (fija la imagen local cacheada)
   -File PATH             Ruta del compose a generar (por defecto compose.yaml)
 
 Seguridad:
@@ -291,7 +293,7 @@ $c += "# Runners: {0} | repo: {1}/{2} | imagen: {3}`n`n" -f $Count, $Owner, $Nam
 $c += "x-runner-common: &runner-common`n"
 $c += "  image: $Image`n"
 $c += "  restart: always`n"
-if ($PullAlways) { $c += "  pull_policy: always`n" }
+if (-not $NoPullAlways) { $c += "  pull_policy: always`n" }   # default: always (opt-out con -NoPullAlways)
 $c += "  env_file: [.env]`n"
 if ($Secret) { $c += "  secrets:`n    - access_token`n" }
 if ($Cpus -or $Memory) {
