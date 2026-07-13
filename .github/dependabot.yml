@@ -2,7 +2,7 @@ version: 2
 updates:
   # Mantiene actualizadas las actions usadas en los workflows (build-image.yml, ci.yml).
   # Nota: el ecosystem `docker` NO se incluye porque busca `Dockerfile` y este repo
-  # usa `Containerfile`; la versión del runner la refresca el rebuild semanal de
+  # usa `Containerfile`; la versión del runner la refresca el rebuild diario de
   # build-image.yml.
   - package-ecosystem: github-actions
     directory: "/"

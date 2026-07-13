@@ -16,9 +16,9 @@ on:
       - .github/workflows/build-image.yml
   workflow_dispatch:
   schedule:
-    # Lunes 06:00 UTC: reconstruye con la última versión de actions/runner para
-    # no quedar por debajo del mínimo que exige GitHub.
-    - cron: "0 6 * * 1"
+    # Todos los días 06:00 UTC: reconstruye con la última versión de
+    # actions/runner para no quedar por debajo del mínimo que exige GitHub.
+    - cron: "0 6 * * *"
 
 permissions:
   contents: read
@@ -59,7 +59,7 @@ jobs:
             type=ref,event=tag
 
       # Resuelve la última versión de actions/runner para que cada build (sobre
-      # todo el semanal) use la más reciente. contents:read basta para el repo público.
+      # todo el diario) use la más reciente. contents:read basta para el repo público.
       - name: Resolve latest actions/runner version
         id: runnerver
         env:
