@@ -59,6 +59,8 @@ MEMORY=""           # límite de memoria por runner
 USE_SECRET="no"     # --secret: PAT como file-secret en vez de en .env
 SECRET_FILE="access_token"
 ENGINE_PREF=""      # --engine: forzar podman o docker
+BOOTSTRAP="yes"     # instalar podman/compose y crear la machine si faltan (opt-out --no-bootstrap)
+PM=""; MACHINE="no" # los rellena bootstrap_env (gestor de paquetes / si hay VM)
 
 # ---- Utilidades ------------------------------------------------------------
 err()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -83,6 +85,87 @@ guard_secret_file() {
     [ -e "$1" ] || return 0
     [ "$FORCE" = "yes" ] && return 0
     err "ya existe '$1' (fichero del secret). Bórralo o usa --force para sobreescribir."
+}
+
+# Devuelve el comando de compose para el motor $1, o nada si no hay proveedor.
+compose_for() {
+    case "$1" in
+        podman)
+            if podman compose version >/dev/null 2>&1; then printf 'podman compose'
+            elif command -v podman-compose >/dev/null 2>&1; then printf 'podman-compose'
+            fi ;;
+        docker)
+            if docker compose version >/dev/null 2>&1; then printf 'docker compose'
+            elif command -v docker-compose >/dev/null 2>&1; then printf 'docker-compose'
+            fi ;;
+    esac
+}
+
+# Rechaza valores con saltos de línea / caracteres de control antes de escribirlos
+# al compose/.env (anti-inyección YAML/.env). Contamos bytes de control con wc -c
+# (NO usamos $(...) sobre el residuo: la sustitución elimina los \n finales y
+# dejaría pasar justo la inyección por newline).
+assert_clean() {
+    _ctrl="$(printf '%s' "$2" | LC_ALL=C tr -cd '[:cntrl:]' | wc -c | tr -dc '0-9')"
+    if [ "${_ctrl:-0}" -gt 0 ]; then
+        err "valor inválido para $1: contiene saltos de línea o caracteres de control (posible inyección)."
+    fi
+}
+
+# ---- Bootstrap del entorno (podman + compose + machine) --------------------
+# Instala lo que falte. Matriz: macOS/brew · Fedora/dnf ·
+# Debian·Ubuntu·Raspberry Pi OS/apt · (Windows -> deploy.ps1/winget). Es no-op
+# limpio si ya está todo (no exige detectar gestor en ese caso).
+_pm_hint="Soportado: macOS (brew), Fedora (dnf), Debian/Ubuntu/Raspberry Pi OS (apt), Windows (deploy.ps1/winget)."
+ensure_podman() {
+    command -v podman >/dev/null 2>&1 && return 0
+    [ -n "$PM" ] || err "falta podman y no detecté un gestor soportado. ${_pm_hint} Instálalo a mano o usa --no-bootstrap."
+    info "podman no está instalado; instalando con ${PM}..."
+    case "$PM" in
+        brew) brew install podman ;;
+        dnf)  sudo dnf install -y podman ;;
+        apt)  sudo apt-get update && sudo apt-get install -y podman ;;
+    esac
+    command -v podman >/dev/null 2>&1 || err "la instalación de podman no dejó 'podman' en el PATH."
+}
+ensure_compose() {
+    [ -n "$(compose_for podman)" ] && return 0
+    if command -v docker >/dev/null 2>&1 && [ -n "$(compose_for docker)" ]; then return 0; fi
+    [ -n "$PM" ] || err "falta un proveedor de compose y no detecté un gestor soportado. ${_pm_hint} Usa --no-bootstrap."
+    info "Falta un proveedor de compose; instalando con ${PM}..."
+    case "$PM" in
+        brew) brew install docker-compose ;;
+        dnf)  sudo dnf install -y podman-compose ;;
+        apt)  sudo apt-get update && sudo apt-get install -y podman-compose ;;
+    esac
+    [ -n "$(compose_for podman)" ] && return 0
+    if command -v docker >/dev/null 2>&1 && [ -n "$(compose_for docker)" ]; then return 0; fi
+    err "tras instalar sigo sin un proveedor de compose funcional."
+}
+ensure_machine() {
+    [ "$MACHINE" = "yes" ] || return 0   # solo macOS/Windows corren podman en una VM
+    if [ -z "$(podman machine list --format '{{.Name}}' 2>/dev/null)" ]; then
+        info "No hay podman machine; creándola (init --now)..."
+        podman machine init --now
+    elif ! podman info >/dev/null 2>&1; then
+        info "Arrancando la podman machine..."
+        podman machine start 2>/dev/null || true
+    fi
+}
+bootstrap_env() {
+    # Detecta gestor y si hay VM; NO falla si no hay gestor (las ensure_* solo lo
+    # exigen cuando de verdad tienen que instalar → no-op en host ya provisionado).
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        Darwin)
+            MACHINE="yes"
+            if command -v brew >/dev/null 2>&1; then PM="brew"; fi ;;
+        Linux)
+            if command -v dnf >/dev/null 2>&1; then PM="dnf"
+            elif command -v apt-get >/dev/null 2>&1; then PM="apt"; fi ;;
+    esac
+    ensure_podman
+    ensure_compose
+    ensure_machine
 }
 
 usage() {
@@ -125,6 +208,7 @@ Ejecución:
   --no-up                No lo levanta (solo genera los ficheros)
   --skip-validation      No validar el token contra la API antes de escribir
   --force                Sobreescribe compose.yaml/.env aunque no los generara deploy.sh
+  --no-bootstrap         No instalar podman/compose ni crear la machine (gestionas el entorno tú)
   -h, --help             Esta ayuda
 
 Variables de entorno usadas como fallback:
@@ -159,6 +243,7 @@ while [ "$#" -gt 0 ]; do
         --no-up)       DO_UP="no"; shift ;;
         --skip-validation) SKIP_VALIDATION="yes"; shift ;;
         --force)       FORCE="yes"; shift ;;
+        --no-bootstrap) BOOTSTRAP="no"; shift ;;
         -h|--help)     usage 0 ;;
         *) err "opción desconocida: $1 (usa --help)" ;;
     esac
@@ -205,6 +290,18 @@ IMAGE="${IMAGE:-${ENV_IMAGE:-$IMAGE_DEFAULT}}"
 CPUS="${CPUS:-${RUNNER_CPUS:-}}"
 MEMORY="${MEMORY:-${RUNNER_MEMORY:-}}"
 
+# Anti-inyección: nada que llegue al compose/.env puede traer saltos de línea
+# o caracteres de control.
+assert_clean owner "$OWNER"
+assert_clean name "$NAME"
+assert_clean prefix "$PREFIX"
+assert_clean labels "$LABELS"
+assert_clean group "$GROUP"
+assert_clean image "$IMAGE"
+assert_clean cpus "$CPUS"
+assert_clean memory "$MEMORY"
+assert_clean cache-dirs "$CACHE_DIRS_CSV"
+
 # Token: --token -> ACCESS_TOKEN -> `gh auth token` -> prompt.
 if [ -z "$TOKEN" ]; then
     if [ -n "${ACCESS_TOKEN:-}" ]; then
@@ -222,22 +319,17 @@ fi
 case "$COUNT" in ''|*[!0-9]*) err "--count debe ser un entero positivo" ;; esac
 [ "$COUNT" -ge 1 ] || err "--count debe ser >= 1"
 
+# ---- Arquitectura soportada (la imagen es arm64/amd64) --------------------
+case "$(uname -m 2>/dev/null || echo)" in
+    armv7l|armv6l|armhf|armel)
+        err "arquitectura de 32 bits no soportada: la imagen es arm64/amd64. En Raspberry Pi usa un SO de 64 bits (arm64)." ;;
+esac
+
+# ---- Bootstrap del entorno (podman/compose/machine), salvo --no-bootstrap --
+[ "$BOOTSTRAP" = "yes" ] && bootstrap_env
+
 # ---- Detección de motor y compose -----------------------------------------
 case "$ENGINE_PREF" in ''|podman|docker) : ;; *) err "--engine debe ser podman o docker" ;; esac
-
-# Devuelve el comando de compose para el motor $1, o nada si no hay proveedor.
-compose_for() {
-    case "$1" in
-        podman)
-            if podman compose version >/dev/null 2>&1; then printf 'podman compose'
-            elif command -v podman-compose >/dev/null 2>&1; then printf 'podman-compose'
-            fi ;;
-        docker)
-            if docker compose version >/dev/null 2>&1; then printf 'docker compose'
-            elif command -v docker-compose >/dev/null 2>&1; then printf 'docker-compose'
-            fi ;;
-    esac
-}
 
 # Prefiere el motor forzado con --engine; si no, podman y luego docker. Se elige
 # el primero que tenga un proveedor de compose funcionando.
@@ -267,17 +359,25 @@ if [ -z "$ENGINE" ]; then
     fi
 fi
 
+# Aviso de capacidad: los proveedores "legacy" pueden no soportar todo el compose.
+case "$COMPOSE" in
+    podman-compose|docker-compose)
+        info "AVISO: '$COMPOSE' puede no soportar del todo 'secrets:'/'deploy:'/merge YAML del compose generado. Si 'up' falla, usa 'podman compose' o 'docker compose' (plugin v2)." ;;
+esac
+
 # ---- Validación del token contra la API (fail-fast) -----------------------
-if [ "$SKIP_VALIDATION" != "yes" ] && command -v curl >/dev/null 2>&1; then
+if [ "$SKIP_VALIDATION" != "yes" ]; then
+    command -v curl >/dev/null 2>&1 || err "falta 'curl' para validar el token. Instálalo o pasa --skip-validation."
     info "Validando el token contra la API de GitHub..."
     _tmp="$(mktemp)"
-    _http="$(curl -sSL -o "$_tmp" -w '%{http_code}' \
-        -X POST \
-        -H "Accept: application/vnd.github+json" \
-        -H "Authorization: Bearer ${TOKEN}" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        "https://api.github.com/repos/${OWNER}/${NAME}/actions/runners/registration-token" \
-        2>/dev/null || true)"
+    # El PAT va por --config (stdin), NO por argv, para no exponerlo en `ps`.
+    _http="$(printf 'header = "Authorization: Bearer %s"' "$TOKEN" \
+        | curl -sSL -o "$_tmp" -w '%{http_code}' --config - \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${OWNER}/${NAME}/actions/runners/registration-token" \
+            2>/dev/null || true)"
     if [ "$_http" != "201" ]; then
         _msg="$(jq -r '.message // "sin mensaje"' <"$_tmp" 2>/dev/null || echo 'sin mensaje')"
         rm -f "$_tmp"
