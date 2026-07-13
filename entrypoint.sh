@@ -41,6 +41,10 @@ RUNNER_DISABLE_UPDATE="${RUNNER_DISABLE_UPDATE:-yes}"
 
 cd /home/runner
 
+# Limpia los logs _diag del ciclo anterior (ya capturados por `podman logs`);
+# así no se acumulan en la capa del contenedor entre recreates.
+rm -rf /home/runner/_diag/* 2>/dev/null || true
+
 # Asegura que los mountpoints de volúmenes pertenezcan a runner. Un volumen
 # nombrado recién creado sobre un dir que NO existía en la imagen se monta como
 # root; basta un chown no-recursivo del mountpoint (lo que escriba runner
@@ -48,7 +52,9 @@ cd /home/runner
 # runner desde la imagen, así que se saltan. CACHE_DIRS lo puebla deploy.sh.
 for _d in /home/runner/_work /home/runner/.cache ${CACHE_DIRS:-}; do
     [ -d "$_d" ] || continue
-    [ -O "$_d" ] || sudo chown runner:runner "$_d" 2>/dev/null || true
+    [ -O "$_d" ] && continue
+    sudo chown runner:runner "$_d" 2>/dev/null \
+        || echo "AVISO: no se pudo ajustar el dueño de ${_d}; podría causar errores de permisos en el job." >&2
 done
 
 # ---- Backoff anti crash-loop (protege el rate limit de GitHub) -------------
@@ -86,7 +92,7 @@ date +%s > "$_stamp"
 # errores van por stderr. No filtra el PAT ni el cuerpo completo a los logs.
 # ---------------------------------------------------------------------------
 mint_token() {
-    local kind="$1" max="${2:-4}" attempt=0 http body token tmp hdr retry reset remain
+    local kind="$1" max="${2:-4}" attempt=0 http body token tmp hdr retry reset remain wait_s
     while :; do
         tmp="$(mktemp)"; hdr="$(mktemp)"
         http="$(curl -sSL -D "$hdr" -o "$tmp" -w '%{http_code}' \
@@ -128,6 +134,24 @@ mint_token() {
             sleep "$retry"
             continue
         fi
+
+        # 5xx o fallo de red/DNS/TLS (http=000/vacío): transitorio → reintentar
+        # in-process en vez de salir y depender del restart (evita churn del
+        # contenedor por un blip); mantiene 401/403-perm/404 como fail-fast abajo.
+        case "${http:-000}" in
+            5[0-9][0-9]|000)
+                rm -f "$tmp" "$hdr"
+                if [ "$attempt" -ge "$max" ]; then
+                    echo "ERROR: ${kind} falló por error transitorio (HTTP ${http:-000}) tras ${attempt} reintento(s)." >&2
+                    return 1
+                fi
+                attempt=$(( attempt + 1 ))
+                wait_s=$(( attempt * 5 ))
+                echo "Error transitorio de GitHub (HTTP ${http:-000}); reintento ${attempt}/${max} en ${wait_s}s..." >&2
+                sleep "$wait_s"
+                continue
+                ;;
+        esac
 
         # Error real (no rate limit): no reintentar.
         echo "ERROR: la API de GitHub (${kind}) devolvió HTTP ${http:-000}." >&2
@@ -235,22 +259,33 @@ esac
 
 ./config.sh "${config_args[@]}"
 
+# Si nos pidieron parar durante config.sh (el trap se difiere mientras config.sh
+# corre en primer plano), no arranques un job: desregistra y sal limpio.
+[ "$_terminating" = "1" ] && { deregister; exit 0; }
+
 # run.sh en segundo plano para poder reenviarle la señal en un `podman stop`.
 export RUNNER_MANUALLY_TRAP_SIG=1
 ./run.sh &
 RUNNER_PID=$!
 
 # `wait` retorna al recibir una señal (el trap ya la reenvió a run.sh), así que
-# reintentamos hasta que run.sh termine de verdad.
-wait "$RUNNER_PID" 2>/dev/null || true
+# reintentamos hasta que run.sh termine de verdad, capturando su código de salida.
+run_rc=0
+wait "$RUNNER_PID" 2>/dev/null || run_rc=$?
 while kill -0 "$RUNNER_PID" 2>/dev/null; do
-    wait "$RUNNER_PID" 2>/dev/null || true
+    run_rc=0
+    wait "$RUNNER_PID" 2>/dev/null || run_rc=$?
 done
 
-# Solo desregistramos si nos pararon estando idle. En el camino efímero normal
-# run.sh ya salió (el runner se auto-desregistró) y esto no se ejecuta.
-[ "$_terminating" = "1" ] && deregister
-
-# Marca el ciclo como SANO: el siguiente arranque no aplicará backoff.
-: > "$_ok" 2>/dev/null || true
+if [ "$_terminating" = "1" ]; then
+    # Nos pararon (idle o drenando un job): desregistrar. No se marca .ok.
+    deregister
+elif [ "$run_rc" -eq 0 ]; then
+    # Ciclo SANO: run.sh completó su job y salió 0 → el siguiente arranque no
+    # aplicará backoff. (Un job de workflow que falla igual sale con 0.)
+    : > "$_ok" 2>/dev/null || true
+fi
+# Si run.sh falló (run_rc != 0) sin parada: NO se marca .ok, para que el backoff
+# throttlee un crash-loop en la etapa run.sh (sesión rechazada, "registration
+# deleted", runner bajo el mínimo, 5xx) y evite una tormenta de tokens.
 exit 0
