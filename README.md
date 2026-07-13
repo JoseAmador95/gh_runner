@@ -14,17 +14,20 @@ Características:
 
 ## Requisitos por sistema operativo
 
-Siempre es un **contenedor Linux** (Ubuntu 24.04). El host solo necesita un motor de contenedores:
+Siempre es un **contenedor Linux** (Ubuntu 24.04). **`deploy.sh`/`deploy.ps1` hacen el bootstrap del entorno**: si falta `podman`, el proveedor de compose o (en macOS/Windows) la *machine*, los instalan/crean automáticamente. Opt-out con `--no-bootstrap` / `-NoBootstrap` si prefieres gestionarlo tú.
 
-| Host | Motor | Notas |
-|------|-------|-------|
-| **Mac mini (Apple Silicon, arm64)** | Podman | `brew install podman docker-compose && podman machine init && podman machine start`. Usa la imagen arm64. |
-| **Fedora (x86_64)** | Podman (o Docker) | `sudo dnf install podman podman-compose`. Nativo amd64. |
-| **Windows (x86_64)** | Podman Desktop o Docker Desktop | Backend **WSL2**. Ejecuta `deploy.sh` en **Git Bash**/**WSL2**, o `deploy.ps1` en **PowerShell**. Corre la imagen amd64 como contenedor Linux. |
+| Host | Gestor | Qué instala/crea el bootstrap |
+|------|--------|-------------------------------|
+| **macOS** (Apple Silicon / Intel) | Homebrew | `brew install podman docker-compose` + `podman machine init --now`. Requiere [Homebrew](https://brew.sh). |
+| **Fedora** | dnf | `sudo dnf install -y podman podman-compose`. Nativo. |
+| **Debian / Ubuntu / Raspberry Pi OS** | apt | `sudo apt-get install -y podman podman-compose`. Nativo. |
+| **Windows** | winget | `deploy.ps1`: `winget install RedHat.Podman` + `podman machine init --now` (WSL2). O usa `deploy.sh` en Git Bash/WSL2. |
 
-`deploy.sh` es un script POSIX `sh`; necesita `curl` en el host (y `jq` opcional, solo para un mensaje de error más claro al validar el token).
+> ⚠️ **Raspberry Pi debe correr un SO de 64 bits** (arm64): la imagen es multi-arch `arm64`+`amd64`, no hay build de 32 bits (armhf/armv7). `deploy.sh` aborta si detecta un host de 32 bits.
+>
+> El bootstrap usa `sudo` en Linux (instala paquetes en el host) y es idempotente (no-op si ya tienes todo). `deploy.sh` es POSIX `sh`; necesita `curl` (obligatorio para validar el token, salvo `--skip-validation`) y `jq` opcional.
 
-> **Podman no incluye `compose`**: necesita un proveedor externo — `podman-compose` (`pip3 install podman-compose` o el paquete de tu distro) o el binario `docker-compose` (`brew install docker-compose`; en Windows suele venir con Docker Desktop). Si ves `falta un proveedor de compose para podman`, instala uno. `deploy.sh`/`deploy.ps1` autodetectan el motor: prefieren Podman con compose y, si Podman no tiene proveedor, **caen a Docker**; puedes forzarlo con `--engine`/`-Engine podman|docker`.
+> **Podman no incluye `compose`** (necesita un proveedor externo). El bootstrap lo instala; con `--no-bootstrap` instálalo tú: `podman-compose` (paquete de tu distro / `pip3 install podman-compose`) o `docker-compose` (`brew install docker-compose`; en Windows suele venir con Docker Desktop). `deploy.sh`/`deploy.ps1` autodetectan el motor: prefieren Podman con compose y, si no, **caen a Docker**; fuérzalo con `--engine`/`-Engine podman|docker`. Nota: `podman-compose`/`docker-compose` v1 tienen soporte **parcial** de `secrets:`/`deploy:` — para todo, usa `podman compose` o `docker compose` (plugin v2).
 >
 > Cuando Podman usa un proveedor externo imprime un aviso `>>>> Executing external compose provider … <<<<` (a stderr, **inofensivo**). Para silenciarlo, en tu `containers.conf` (`~/.config/containers/containers.conf` en Linux, `%APPDATA%\containers\containers.conf` en Windows) pon:
 > ```ini
@@ -61,7 +64,7 @@ irm https://raw.githubusercontent.com/JoseAmador95/gh_runner/main/deploy.ps1 -Ou
 ```
 
 - Sin `-Token`, toma el PAT de `$env:ACCESS_TOKEN`, luego de `gh auth token`, y si no lo pide (oculto).
-- Mismos flags que `deploy.sh` pero con guion simple: `-Count`, `-Prefix`, `-Labels`, `-Secret`, `-Cpus`, `-Memory`, `-Engine`, `-Force`, `-NoUp`, `-Help`, etc.
+- Mismos flags que `deploy.sh` pero con guion simple: `-Count`, `-Prefix`, `-Labels`, `-Secret`, `-Cpus`, `-Memory`, `-Engine`, `-Force`, `-NoBootstrap`, `-NoUp`, `-Help`, etc.
 - Si `.\deploy.ps1` queda bloqueado por la Execution Policy, usa `pwsh -ExecutionPolicy Bypass -File .\deploy.ps1 …` o `Unblock-File .\deploy.ps1`.
 - **Permisos:** en NTFS restringe `.env`/`access_token` con `icacls` (best-effort), igual que en Git Bash.
 
@@ -163,6 +166,7 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/JoseAmador95/gh_runner/mai
 | `--up` / `--no-up` | Levantar o no el stack tras generar | — |
 | `--skip-validation` | No validar el token contra la API | — |
 | `--force` | Sobreescribe `compose.yaml`/`.env`/`access_token` ajenos | — |
+| `--no-bootstrap` | No instalar podman/compose ni crear la machine | — |
 | `-h`, `--help` | Ayuda | — |
 
 > GitHub añade **automáticamente** las etiquetas `self-hosted`, `Linux` y la arquitectura (`X64`/`ARM64`). `--labels` es solo para etiquetas **extra** (p.ej. `gpu`, `mi-proyecto`).
@@ -268,6 +272,23 @@ El compose usa `restart: always`: si un contenedor se cae, el motor lo recrea, *
 - **Windows:** activa *"Start on login"* en Podman/Docker Desktop y asegúrate de que la distro WSL2 arranque.
 
 > Actualizar la imagen, escalar y hacer teardown se explican en **§4 Operación diaria**.
+
+### Mantener el runner al día (importante con `--disableupdate`)
+
+Los runners **no** se auto-actualizan (variable `RUNNER_DISABLE_UPDATE`), y el ciclo efímero es un **restart** que **no** hace `pull`. Pero GitHub **exige** que el runner esté dentro de los ~30 días de la última versión, y el **mínimo de ejecución avanza** con el tiempo (enforcement en github.com desde ~sep-2026): un runner que nunca se recrea acabará **rechazado** (deja de tomar jobs).
+
+Solución: **recrea periódicamente** para adoptar la imagen del rebuild diario. El repo trae **`refresh.sh`** (hace `pull` + `up -d` en el directorio del despliegue); agéndalo, p.ej. semanal:
+
+- **Linux (systemd user timer):** un `gh-runner-refresh.service` (`ExecStart=/ruta/refresh.sh`, `WorkingDirectory=/ruta/deploy`) + `.timer` (`OnCalendar=weekly`, `Persistent=true`), y:
+  ```bash
+  systemctl --user enable --now gh-runner-refresh.timer
+  loginctl enable-linger "$USER"
+  ```
+- **Linux / macOS (cron):** `0 5 * * 1 cd /ruta/deploy && /ruta/refresh.sh >> refresh.log 2>&1`
+- **macOS (launchd):** un agente con `StartCalendarInterval` que corra `refresh.sh` en el dir del despliegue.
+- **Windows (Task Scheduler):** una tarea semanal `pwsh -File refresh` — o en PowerShell puro, en el dir del despliegue: `podman compose pull; podman compose up -d`.
+
+> Alternativa: si prefieres no agendar nada, reactiva el auto-update con `RUNNER_DISABLE_UPDATE=no` en `.env` — pero entonces un update a mitad de job puede cancelarlo (por eso el default es desactivarlo).
 
 ---
 

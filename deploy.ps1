@@ -45,6 +45,7 @@ param(
     [switch]$NoUp,
     [switch]$SkipValidation,
     [switch]$Force,
+    [switch]$NoBootstrap,
     [switch]$Help
 )
 
@@ -64,6 +65,13 @@ $ImageDefault = 'ghcr.io/joseamador95/gh_runner:latest'
 function Die($m)  { [Console]::Error.WriteLine("ERROR: $m"); exit 1 }
 function Info($m) { [Console]::Error.WriteLine($m) }
 function Have($n) { [bool](Get-Command $n -ErrorAction SilentlyContinue) }
+
+# Rechaza valores con saltos de línea / caracteres de control (anti-inyección YAML/.env).
+function Assert-Clean($name, $val) {
+    if ($val -and $val -match '[\x00-\x1F\x7F]') {
+        Die "valor inválido para ${name}: contiene saltos de línea o caracteres de control (posible inyección)."
+    }
+}
 
 function Show-Usage {
     @"
@@ -97,6 +105,7 @@ Ejecución:
   -Up / -NoUp            Levantar o no el stack tras generar
   -SkipValidation        No validar el token contra la API
   -Force                 Sobreescribe compose.yaml/.env/access_token ajenos
+  -NoBootstrap           No instalar podman/compose ni crear la machine (gestionas el entorno tú)
   -Help                  Esta ayuda
 
 Variables de entorno usadas como fallback:
@@ -122,13 +131,32 @@ if (-not $Name)  { if ($Interactive) { $Name  = (Read-Host 'Nombre del repo (REP
 if (-not $Owner -or -not $Name) { Die "faltan owner y/o name del repositorio" }
 
 if (-not $Prefix) { $Prefix = if ($env:RUNNER_PREFIX) { $env:RUNNER_PREFIX } else { 'gh' } }
-if ($Count -le 0) { $Count  = if ($env:RUNNER_COUNT) { [int]$env:RUNNER_COUNT } else { 1 } }
+if ($PSBoundParameters.ContainsKey('Count')) {
+    if ($Count -lt 1) { Die "-Count debe ser >= 1" }
+}
+elseif ($env:RUNNER_COUNT) {
+    if ($env:RUNNER_COUNT -notmatch '^\d+$') { Die "RUNNER_COUNT debe ser un entero positivo" }
+    $Count = [int]$env:RUNNER_COUNT
+    if ($Count -lt 1) { Die "RUNNER_COUNT debe ser >= 1" }
+}
+else { $Count = 1 }
 if (-not $Labels) { $Labels = $env:RUNNER_LABELS }
 if (-not $Group)  { $Group  = $env:RUNNER_GROUP }
 if (-not $Image)  { $Image  = if ($env:IMAGE) { $env:IMAGE } else { $ImageDefault } }
 if (-not $Cpus)   { $Cpus   = $env:RUNNER_CPUS }
 if (-not $Memory) { $Memory = $env:RUNNER_MEMORY }
-if ($Count -lt 1) { Die "-Count debe ser >= 1" }
+
+# Anti-inyección: nada que llegue al compose/.env con saltos de línea o control.
+Assert-Clean owner  $Owner
+Assert-Clean name   $Name
+Assert-Clean prefix $Prefix
+Assert-Clean labels $Labels
+Assert-Clean group  $Group
+Assert-Clean image  $Image
+Assert-Clean cpus   $Cpus
+Assert-Clean memory $Memory
+Assert-Clean 'cache-dirs' $CacheDirs
+if ($PullAlways -and $NoPullAlways) { Die "no combines -PullAlways y -NoPullAlways" }
 
 # ---- Token: flag -> ACCESS_TOKEN -> 'gh auth token' -> prompt --------------
 $tokenSrc = 'flag -Token'
@@ -174,6 +202,45 @@ function Get-ComposeFor($eng) {
     return $null
 }
 
+# ---- Bootstrap del entorno (podman + compose + machine) -------------------
+# Windows: winget para podman; podman machine (WSL2) si no existe. -NoBootstrap
+# lo salta. No-op si ya está todo.
+function Ensure-Podman {
+    if (Have 'podman') { return }
+    if (-not (Have 'winget')) { Die "falta podman y no hay winget. Instala Podman Desktop (https://podman-desktop.io) o usa -NoBootstrap." }
+    Info "podman no está instalado; instalando con winget (RedHat.Podman)..."
+    & winget install -e --id RedHat.Podman --accept-source-agreements --accept-package-agreements
+    if (-not (Have 'podman')) { Die "la instalación no dejó 'podman' en el PATH; reinicia la shell y reintenta (o usa -NoBootstrap)." }
+}
+function Ensure-Compose {
+    if (Get-ComposeFor 'podman') { return }
+    if ((Have 'docker') -and (Get-ComposeFor 'docker')) { return }
+    if (Have 'winget') {
+        Info "Falta un proveedor de compose; instalando docker-compose con winget..."
+        & winget install -e --id Docker.DockerCompose --accept-source-agreements --accept-package-agreements
+    }
+    if (Get-ComposeFor 'podman') { return }
+    if ((Have 'docker') -and (Get-ComposeFor 'docker')) { return }
+    Die "sigo sin un proveedor de compose. Instala 'docker compose' (Docker/Podman Desktop) o usa -NoBootstrap."
+}
+function Ensure-Machine {
+    if (-not (Have 'podman')) { return }
+    $names = & podman machine list --format '{{.Name}}' 2>$null
+    if (-not $names) {
+        Info "No hay podman machine; creándola (init --now)..."
+        & podman machine init --now
+    }
+    else {
+        & podman info *> $null
+        if ($LASTEXITCODE -ne 0) { Info "Arrancando la podman machine..."; & podman machine start *> $null }
+    }
+}
+if (-not $NoBootstrap) {
+    Ensure-Podman
+    Ensure-Compose
+    Ensure-Machine
+}
+
 $engines = if ($Engine) { , $Engine } else { @('podman', 'docker') }
 $ComposeCmd = $null
 $EngineName = $null
@@ -194,6 +261,11 @@ hay motor de contenedores pero falta un proveedor de compose. Instala uno:
 "@
     }
     else { Die "no se encontró 'podman' ni 'docker' en el PATH" }
+}
+
+# Aviso de capacidad: proveedores "legacy" con soporte parcial del compose.
+if ($ComposeCmd.Count -eq 1 -and $ComposeCmd[0] -in @('podman-compose', 'docker-compose')) {
+    Info "AVISO: '$($ComposeCmd[0])' puede no soportar del todo 'secrets:'/'deploy:'/merge YAML. Si 'up' falla, usa 'podman compose' o 'docker compose' (plugin v2)."
 }
 
 # ---- Validación del token contra la API (fail-fast) -----------------------
@@ -224,7 +296,7 @@ if (-not $hostShort) { $hostShort = 'runner' }
 
 # ---- Helpers de escritura (UTF-8 sin BOM, saltos LF) ----------------------
 function Write-TextLf($path, $text) {
-    $full = Join-Path (Get-Location).ProviderPath $path
+    $full = if ([System.IO.Path]::IsPathRooted($path)) { $path } else { Join-Path (Get-Location).ProviderPath $path }
     $enc = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($full, $text, $enc)
 }
@@ -233,8 +305,9 @@ function Protect-File($path) {
     try {
         $full = (Resolve-Path -LiteralPath $path).ProviderPath
         & icacls $full /inheritance:r /grant:r "$($env:USERNAME):(F)" *> $null
+        if ($LASTEXITCODE -ne 0) { Info "AVISO: no se pudieron restringir los permisos de ${path} (icacls). Protégelo a mano si el host es compartido." }
     }
-    catch { }
+    catch { Info "AVISO: no se pudieron restringir los permisos de ${path}." }
 }
 function Test-Ours($path) {
     if (-not (Test-Path -LiteralPath $path)) { return $true }
