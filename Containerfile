@@ -58,6 +58,15 @@ RUN /home/runner/bin/installdependencies.sh \
     && chown -R runner:runner /home/runner/_work /home/runner/.cache
 USER runner
 
+# Cache de paquetes para acelerar los jobs (ver README §6 "Acelerar descargas").
+# - pnpm: el store va DENTRO de _work para (1) persistir entre ciclos efímeros y
+#   (2) estar en el MISMO filesystem que node_modules (_work/<repo>) → instala por
+#   hard-links, sin volver a descargar. (Cross-FS pnpm copiaría en vez de enlazar.)
+# - npm: su cache va al volumen persistente .cache (copy-based, cross-FS OK).
+# Ambas son overridables por el workflow.
+ENV npm_config_store_dir=/home/runner/_work/.pnpm-store \
+    npm_config_cache=/home/runner/.cache/npm
+
 COPY --chown=runner:runner entrypoint.sh /home/runner/entrypoint.sh
 RUN chmod +x /home/runner/entrypoint.sh
 

@@ -255,6 +255,18 @@ Cada runner monta volúmenes **propios** (no compartidos, para evitar corrupció
 
 Para **limpiar** el cache: `… down -v` (borra los volúmenes).
 
+### Acelerar descargas (clone, `pnpm install`, "post")
+
+El cuello de botella suele ser la red de los jobs, no el runner. Cómo aprovechar los volúmenes persistentes:
+
+- **`pnpm install` (el gran lever):** la imagen ya fija `npm_config_store_dir=/home/runner/_work/.pnpm-store`. El store queda **dentro de `_work`** → persiste entre jobs **y** está en el **mismo filesystem** que `node_modules` (`_work/<repo>`), así que pnpm instala por **hard-links, sin descargar**. (Si el store estuviera en otro volumen, pnpm *copiaría* en vez de enlazar — por eso va en `_work`, no en `.cache`.) Instala con `pnpm install --frozen-lockfile --prefer-offline`.
+- **Quita `actions/cache` (y `setup-node` con `cache: pnpm`):** en self-hosted esos pasos suben/bajan el store al *cache service* de GitHub (Azure) — lento y **redundante** con el store local. Ese es el paso **"post"** que ves; al quitarlo, desaparece.
+- **Clone:** el `.git` persiste en `_work` → `actions/checkout` hace *fetch* incremental (solo el 1er job por runner clona en frío). Mantén `fetch-depth` bajo.
+- **npm / yarn:** la imagen apunta el cache de npm a `.cache/npm` (volumen persistente). Para yarn u otros, persiste su cache con `--cache-dirs`.
+- **Opcional — registry local (Verdaccio):** un proxy *pull-through* compartido por los runners del host baja de npmjs **una vez** y cachea; acelera el arranque en frío y comparte cache entre runners sin el riesgo de corromper un store compartido. Corre Verdaccio en el host y apunta los jobs con `npm_config_registry=http://<host>:4873`.
+
+> El store en `_work` crece con el tiempo; acótalo con `pnpm store prune` (p.ej. dentro del `refresh.sh` periódico) o un `down -v` ocasional.
+
 ---
 
 ## 7. Auto-reinicio y aviso sobre reinicios de la máquina
