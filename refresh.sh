@@ -10,7 +10,8 @@
 #
 # Corre esto de forma periódica (systemd timer / cron / launchd / Task
 # Scheduler — ver README) EN EL DIRECTORIO del despliegue (donde está
-# compose.yaml). Sin argumentos, o `refresh.sh --file RUTA` para otro compose.
+# compose.yaml). Sin argumentos; `--file RUTA` para otro compose y
+# `--compose-extra FILE` para el override (autodetecta ./compose.override.yaml).
 # ============================================================================
 set -eu
 
@@ -21,7 +22,14 @@ export MSYS2_ARG_CONV_EXCL='*'
 err() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 COMPOSE_FILE="compose.yaml"
-if [ "${1:-}" = "--file" ]; then COMPOSE_FILE="${2:?falta la ruta tras --file}"; fi
+COMPOSE_EXTRA=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --file)          COMPOSE_FILE="${2:?falta la ruta tras --file}"; shift 2 ;;
+        --compose-extra) COMPOSE_EXTRA="${2:?falta la ruta tras --compose-extra}"; shift 2 ;;
+        *) err "opción desconocida: $1 (usa --file RUTA / --compose-extra FILE)" ;;
+    esac
+done
 
 [ -f "$COMPOSE_FILE" ] || err "no encuentro '$COMPOSE_FILE' en $(pwd).
        Corre refresh.sh en el directorio del despliegue, o pasa --file RUTA."
@@ -48,11 +56,24 @@ for _eng in podman docker; do
 done
 [ -n "$COMPOSE" ] || err "no encontré un motor con proveedor de compose (podman/docker). Ver README."
 
-# Con el nombre autodetectado no hace falta -f.
-case "$COMPOSE_FILE" in
-    compose.yaml|compose.yml|docker-compose.yaml|docker-compose.yml) FILE_ARG="" ;;
-    *) FILE_ARG="-f $COMPOSE_FILE" ;;
-esac
+# Override del proyecto: --compose-extra FILE, o autodetecta ./compose.override.yaml.
+# Debe encadenarse igual que en deploy.sh; si no, el recreate perdería los
+# sidecars/mounts/redes que define el override.
+if [ -z "$COMPOSE_EXTRA" ] && [ -f "compose.override.yaml" ]; then
+    COMPOSE_EXTRA="compose.override.yaml"
+fi
+[ -z "$COMPOSE_EXTRA" ] || [ -f "$COMPOSE_EXTRA" ] || err "--compose-extra: no encuentro '$COMPOSE_EXTRA'"
+
+# Con el nombre autodetectado no hace falta -f... salvo que haya override: pasar
+# cualquier -f desactiva el autoload del base, así que se encadenan AMBOS.
+if [ -n "$COMPOSE_EXTRA" ]; then
+    FILE_ARG="-f $COMPOSE_FILE -f $COMPOSE_EXTRA"
+else
+    case "$COMPOSE_FILE" in
+        compose.yaml|compose.yml|docker-compose.yaml|docker-compose.yml) FILE_ARG="" ;;
+        *) FILE_ARG="-f $COMPOSE_FILE" ;;
+    esac
+fi
 
 printf 'Refrescando imagen y recreando runners (%s)...\n' "$COMPOSE" >&2
 # shellcheck disable=SC2086

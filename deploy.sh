@@ -50,6 +50,9 @@ IMAGE=""
 COMPOSE_FILE="compose.yaml"   # nombre autodetectado -> permite usar `podman compose` sin -f
 ENV_FILE=".env"
 CACHE_DIRS_CSV=""
+MOUNTS=""           # --mount SRC:DST[:ro] (repetible) — volumen/bind extra en CADA runner (newline-delimited)
+NETWORKS=""         # --network NAME[:external] (repetible) — red extra en CADA runner (newline-delimited)
+COMPOSE_EXTRA=""    # --compose-extra FILE — override del proyecto (o autodetecta ./compose.override.yaml)
 PULL_ALWAYS="yes"   # default: pull_policy: always (cada up -d re-baja :latest; opt-out --no-pull-always)
 DO_UP="auto"        # auto|yes|no
 SKIP_VALIDATION="no"
@@ -65,6 +68,12 @@ PM=""; MACHINE="no" # los rellena bootstrap_env (gestor de paquetes / si hay VM)
 # ---- Utilidades ------------------------------------------------------------
 err()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 info() { printf '%s\n' "$*" >&2; }
+
+# Newline literal: acumula flags repetibles (--mount/--network) sin perder el
+# separador. No usamos $(...) para esto porque recorta los \n finales; los
+# valores pueden llevar espacios (rutas de bind), así que \n es el delimitador.
+NL='
+'
 
 MARKER="# GENERADO por deploy"   # prefijo común con deploy.ps1 (reconocimiento cruzado)
 
@@ -190,6 +199,13 @@ Despliegue:
                          prefiere podman con compose y si no cae a docker)
   --cache-dirs A,B       Dirs extra de cache por runner (p.ej. .npm,.cargo);
                          relativas a /home/runner o absolutas
+  --mount SRC:DST[:ro]   Volumen/bind extra en CADA runner (repetible). SRC nombre
+                         de volumen (compartido; se declara) o ruta host (bind).
+  --network NAME[:external]  Red extra en CADA runner (repetible). Para redes
+                         externas ya existentes; los sidecars del propio override
+                         ya son alcanzables por nombre vía la red por defecto.
+  --compose-extra FILE   Override de compose del proyecto a encadenar (por defecto
+                         autodetecta ./compose.override.yaml). deploy.sh no lo genera.
   --cpus N               Límite de CPU por runner (p.ej. 2 o 1.5)
   --memory SIZE          Límite de memoria por runner (p.ej. 2g, 512m)
   --pull-always          (default) pull_policy: always: cada 'up -d' re-baja :latest
@@ -232,6 +248,9 @@ while [ "$#" -gt 0 ]; do
         --image)       IMAGE="${2:?}"; shift 2 ;;
         --engine)      ENGINE_PREF="${2:?}"; shift 2 ;;
         --cache-dirs)  CACHE_DIRS_CSV="${2:?}"; shift 2 ;;
+        --mount)       assert_clean mount "${2:?}";   MOUNTS="${MOUNTS:+$MOUNTS$NL}$2"; shift 2 ;;
+        --network)     assert_clean network "${2:?}"; NETWORKS="${NETWORKS:+$NETWORKS$NL}$2"; shift 2 ;;
+        --compose-extra) assert_clean compose-extra "${2:?}"; COMPOSE_EXTRA="$2"; shift 2 ;;
         --cpus)        CPUS="${2:?}"; shift 2 ;;
         --memory)      MEMORY="${2:?}"; shift 2 ;;
         --pull-always) PULL_ALWAYS="yes"; shift ;;
@@ -427,6 +446,35 @@ info "Escrito $ENV_FILE (chmod 600)."
 norm_dir()   { case "$1" in /*) printf '%s' "$1" ;; *) printf '/home/runner/%s' "$1" ;; esac; }
 vol_suffix() { printf '%s' "$1" | tr -cd 'A-Za-z0-9'; }
 
+# De --mount: volúmenes NOMBRADOS (1er campo sin '/' ni '.'/'~' inicial) para
+# declararlos UNA vez a top-level. Una ruta (bind) no se declara.
+NAMED_VOLS=""
+if [ -n "$MOUNTS" ]; then
+    OLDIFS=$IFS; IFS=$NL
+    for _m in $MOUNTS; do
+        [ -n "$_m" ] || continue
+        _src="${_m%%:*}"
+        case "$_src" in /*|.*|~*|*/*) continue ;; esac
+        case " $NAMED_VOLS " in *" $_src "*) continue ;; esac
+        NAMED_VOLS="${NAMED_VOLS:+$NAMED_VOLS }$_src"
+    done
+    IFS=$OLDIFS
+fi
+
+# De --network: dedup por NOMBRE (1er campo), conservando el sufijo :external.
+NETWORKS_UNIQ=""; _seen_net=""
+if [ -n "$NETWORKS" ]; then
+    OLDIFS=$IFS; IFS=$NL
+    for _n in $NETWORKS; do
+        [ -n "$_n" ] || continue
+        _nname="${_n%%:*}"
+        case " $_seen_net " in *" $_nname "*) continue ;; esac
+        _seen_net="$_seen_net $_nname"
+        NETWORKS_UNIQ="${NETWORKS_UNIQ:+$NETWORKS_UNIQ$NL}$_n"
+    done
+    IFS=$OLDIFS
+fi
+
 {
     printf '%s — no editar a mano.\n' "$MARKER"
     printf '# Runners: %s | repo: %s/%s | imagen: %s\n\n' "$COUNT" "$OWNER" "$NAME" "$IMAGE"
@@ -480,6 +528,27 @@ vol_suffix() { printf '%s' "$1" | tr -cd 'A-Za-z0-9'; }
             done
             IFS=$OLDIFS
         fi
+        # --mount: volúmenes/binds extra (los MISMOS en cada runner).
+        if [ -n "$MOUNTS" ]; then
+            OLDIFS=$IFS; IFS=$NL
+            for _m in $MOUNTS; do
+                [ -n "$_m" ] || continue
+                printf '      - %s\n' "$_m"
+            done
+            IFS=$OLDIFS
+        fi
+        # --network: se listan las redes pedidas + 'default' (para no perder la
+        # red por defecto que hace alcanzables por nombre a los sidecars).
+        if [ -n "$NETWORKS_UNIQ" ]; then
+            printf '    networks:\n'
+            printf '      - default\n'
+            OLDIFS=$IFS; IFS=$NL
+            for _n in $NETWORKS_UNIQ; do
+                [ -n "$_n" ] || continue
+                printf '      - %s\n' "${_n%%:*}"
+            done
+            IFS=$OLDIFS
+        fi
         i=$((i + 1))
     done
     printf '\n'
@@ -499,6 +568,25 @@ vol_suffix() { printf '%s' "$1" | tr -cd 'A-Za-z0-9'; }
         fi
         i=$((i + 1))
     done
+    # Volúmenes nombrados de --mount (declarados una vez, compartidos entre runners).
+    for _v in $NAMED_VOLS; do
+        printf '  %s: {}\n' "$_v"
+    done
+    # Redes de --network (top-level). 'default' explícito para conservar la red
+    # por defecto del proyecto (sidecars alcanzables por nombre).
+    if [ -n "$NETWORKS_UNIQ" ]; then
+        printf '\nnetworks:\n'
+        printf '  default: {}\n'
+        OLDIFS=$IFS; IFS=$NL
+        for _n in $NETWORKS_UNIQ; do
+            [ -n "$_n" ] || continue
+            case "$_n" in
+                *:external) printf '  %s:\n    external: true\n' "${_n%%:*}" ;;
+                *)          printf '  %s: {}\n' "${_n%%:*}" ;;
+            esac
+        done
+        IFS=$OLDIFS
+    fi
     if [ "$USE_SECRET" = "yes" ]; then
         printf '\nsecrets:\n'
         printf '  access_token:\n'
@@ -506,6 +594,14 @@ vol_suffix() { printf '%s' "$1" | tr -cd 'A-Za-z0-9'; }
     fi
 } > "$COMPOSE_FILE"
 info "Escrito $COMPOSE_FILE con $COUNT runner(s)."
+
+# ---- Override del proyecto (compose.override.yaml) -------------------------
+# --compose-extra FILE, o autodetecta ./compose.override.yaml. deploy.sh NO lo
+# genera ni lo pisa (lo posee el proyecto: sidecars, volúmenes/redes a medida).
+if [ -z "$COMPOSE_EXTRA" ] && [ -f "compose.override.yaml" ]; then
+    COMPOSE_EXTRA="compose.override.yaml"
+fi
+[ -z "$COMPOSE_EXTRA" ] || [ -f "$COMPOSE_EXTRA" ] || err "--compose-extra: no encuentro '$COMPOSE_EXTRA'"
 
 # ---- Resumen ---------------------------------------------------------------
 info ""
@@ -521,15 +617,21 @@ else
 fi
 [ -n "$CPUS$MEMORY" ] && info "  Límites : cpus=${CPUS:-—} memoria=${MEMORY:-—}"
 info "  Motor   : ${ENGINE} (${COMPOSE})"
+[ -n "$COMPOSE_EXTRA" ] && info "  Override: ${COMPOSE_EXTRA}"
 
 # ---- Comandos de control ---------------------------------------------------
-# Con el nombre autodetectado (compose.yaml, etc.) no hace falta -f.
-case "$COMPOSE_FILE" in
-    compose.yaml|compose.yml|docker-compose.yaml|docker-compose.yml)
-        FILE_ARG=""; CTL="$COMPOSE" ;;
-    *)
-        FILE_ARG="-f $COMPOSE_FILE"; CTL="$COMPOSE -f $COMPOSE_FILE" ;;
-esac
+# Con el nombre autodetectado (compose.yaml, etc.) no hace falta -f... salvo que
+# haya override: pasar cualquier -f desactiva el autoload del base, así que hay
+# que encadenar AMBOS explícitamente (-f base -f override).
+if [ -n "$COMPOSE_EXTRA" ]; then
+    FILE_ARG="-f $COMPOSE_FILE -f $COMPOSE_EXTRA"
+else
+    case "$COMPOSE_FILE" in
+        compose.yaml|compose.yml|docker-compose.yaml|docker-compose.yml) FILE_ARG="" ;;
+        *) FILE_ARG="-f $COMPOSE_FILE" ;;
+    esac
+fi
+CTL="$COMPOSE${FILE_ARG:+ $FILE_ARG}"
 
 # ---- Levantar el stack -----------------------------------------------------
 if [ "$DO_UP" = "auto" ]; then

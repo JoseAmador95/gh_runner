@@ -35,6 +35,9 @@ param(
     [string]$Image,
     [ValidateSet('podman', 'docker')][string]$Engine,
     [string]$CacheDirs,
+    [string[]]$Mount,
+    [string[]]$Network,
+    [string]$ComposeExtra,
     [string]$Cpus,
     [string]$Memory,
     [switch]$PullAlways,
@@ -92,6 +95,12 @@ Despliegue:
   -Image REF             Imagen (por defecto $ImageDefault)
   -Engine podman|docker  Fuerza el motor (por defecto autodetecta)
   -CacheDirs A,B         Dirs extra de cache por runner (p.ej. .npm,.cargo)
+  -Mount a:/x,b:/y       Volumen/bind extra en CADA runner (lista por comas). SRC
+                         nombre de volumen (compartido; se declara) o ruta (bind).
+  -Network n1,n2         Red extra en CADA runner (lista por comas; n:external para
+                         una red externa ya existente). Los sidecars del override
+                         ya son alcanzables por nombre vía la red por defecto.
+  -ComposeExtra FILE     Override de compose a encadenar (autodetecta compose.override.yaml)
   -Cpus N                Límite de CPU por runner (p.ej. 2)
   -Memory SIZE           Límite de memoria por runner (p.ej. 2g)
   -PullAlways            (default) pull_policy: always: cada 'up -d' re-baja :latest
@@ -360,6 +369,28 @@ if ($CacheDirs) {
     }
 }
 
+# ---- Puntos de extensión: -Mount / -Network (mismos en cada runner) --------
+foreach ($m in $Mount) { Assert-Clean mount $m }
+foreach ($n in $Network) { Assert-Clean network $n }
+
+# Volúmenes NOMBRADOS de -Mount → se declaran una vez a top-level (compartidos).
+# Bind si empieza por ruta (unix / . ~ \) o unidad Windows 'X:\' / 'X:/'.
+$namedVols = [System.Collections.Generic.List[string]]::new()
+foreach ($m in $Mount) {
+    if (-not $m) { continue }
+    if ($m -match '^[A-Za-z]:[\\/]' -or $m -match '^[\\/.~]') { continue }
+    $src = $m.Split(':')[0]
+    if ($src -and -not $namedVols.Contains($src)) { $namedVols.Add($src) }
+}
+
+# Redes de -Network → dedup por NOMBRE (1er campo), conservando el sufijo :external.
+$netUniq = [System.Collections.Generic.List[string]]::new()
+$seenNet = [System.Collections.Generic.HashSet[string]]::new()
+foreach ($n in $Network) {
+    if (-not $n) { continue }
+    if ($seenNet.Add($n.Split(':')[0])) { $netUniq.Add($n) }
+}
+
 # ---- Generar el compose ----------------------------------------------------
 $c = "$Marker — no editar a mano.`n"
 $c += "# Runners: {0} | repo: {1}/{2} | imagen: {3}`n`n" -f $Count, $Owner, $Name, $Image
@@ -390,6 +421,11 @@ for ($i = 1; $i -le $Count; $i++) {
     foreach ($cd in $cacheList) {
         $c += "      - runner-{0}-{1}:{2}`n" -f $i, $cd[1], $cd[0]
     }
+    foreach ($m in $Mount) { if ($m) { $c += "      - {0}`n" -f $m } }
+    if ($netUniq.Count -gt 0) {
+        $c += "    networks:`n      - default`n"
+        foreach ($n in $netUniq) { $c += "      - {0}`n" -f ($n.Split(':')[0]) }
+    }
 }
 $c += "`nvolumes:`n"
 for ($i = 1; $i -le $Count; $i++) {
@@ -399,18 +435,45 @@ for ($i = 1; $i -le $Count; $i++) {
         $c += "  runner-{0}-{1}: {{}}`n" -f $i, $cd[1]
     }
 }
+# Volúmenes nombrados de -Mount (una vez, compartidos entre runners).
+foreach ($v in $namedVols) { $c += "  {0}: {{}}`n" -f $v }
+# Redes de -Network (top-level). 'default' explícito para conservar la red por
+# defecto del proyecto (sidecars alcanzables por nombre).
+if ($netUniq.Count -gt 0) {
+    $c += "`nnetworks:`n  default: {}`n"
+    foreach ($n in $netUniq) {
+        $nm = $n.Split(':')[0]
+        if ($n -like '*:external') { $c += "  {0}:`n    external: true`n" -f $nm }
+        else { $c += "  {0}: {{}}`n" -f $nm }
+    }
+}
 if ($Secret) {
     $c += "`nsecrets:`n  access_token:`n    file: ./access_token`n"
 }
 Write-TextLf $File $c
 Info "Escrito $File con $Count runner(s)."
 
+# ---- Override del proyecto (compose.override.yaml) -------------------------
+# -ComposeExtra FILE, o autodetecta .\compose.override.yaml. No se genera ni pisa.
+if (-not $ComposeExtra -and (Test-Path 'compose.override.yaml')) { $ComposeExtra = 'compose.override.yaml' }
+if ($ComposeExtra -and -not (Test-Path $ComposeExtra)) { Die "-ComposeExtra: no encuentro '$ComposeExtra'" }
+
 # ---- Comandos de control ---------------------------------------------------
+# Pasar cualquier -f desactiva el autoload del base, así que con override se
+# encadenan AMBOS (-f base -f override).
 $auto = @('compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml')
-$fileArgs = @()
-if ($auto -notcontains $File) { $fileArgs = @('-f', $File) }
+if ($ComposeExtra) {
+    $fileArgs = @('-f', $File, '-f', $ComposeExtra)
+    $ctlFiles = "-f $File -f $ComposeExtra"
+}
+elseif ($auto -notcontains $File) {
+    $fileArgs = @('-f', $File); $ctlFiles = "-f $File"
+}
+else {
+    $fileArgs = @(); $ctlFiles = ''
+}
 $composeDisplay = ($ComposeCmd -join ' ')
-$ctl = if ($fileArgs.Count -gt 0) { "$composeDisplay -f $File" } else { $composeDisplay }
+$ctl = if ($ctlFiles) { "$composeDisplay $ctlFiles" } else { $composeDisplay }
 
 function Invoke-Compose {
     $exe = $ComposeCmd[0]
@@ -429,6 +492,7 @@ Info "  Token   : $tokenSrc"
 if ($Secret) { Info "  PAT     : file-secret (.\$SecretFile)" } else { Info "  PAT     : en .env" }
 if ($Cpus -or $Memory) { Info "  Límites : cpus=$(if($Cpus){$Cpus}else{'—'}) memoria=$(if($Memory){$Memory}else{'—'})" }
 Info "  Motor   : $EngineName ($composeDisplay)"
+if ($ComposeExtra) { Info "  Override: $ComposeExtra" }
 
 # ---- Levantar el stack -----------------------------------------------------
 $doUp = if ($NoUp) { $false } elseif ($Up) { $true } else { $Interactive }

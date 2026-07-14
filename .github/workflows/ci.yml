@@ -66,3 +66,37 @@ jobs:
           assert doc["secrets"]["access_token"]["file"] == "./access_token"
           print("compose.yaml OK:", list(svcs))
           PY
+      - name: Genera el compose con --mount/--network + override
+        run: |
+          mkdir -p "$RUNNER_TEMP/ext" && cd "$RUNNER_TEMP/ext"
+          cat > compose.override.yaml <<'OVR'
+          services:
+            verdaccio:
+              image: verdaccio/verdaccio:5
+          OVR
+          # override autodetectado; volumen nombrado (compartido) + bind + red externa (deduplicada)
+          sh "$GITHUB_WORKSPACE/deploy.sh" --no-up --skip-validation \
+            --token FAKE --repo owner/repo --count 2 \
+            --mount sharedcache:/opt/cache --mount /var/run/foo.sock:/foo.sock:ro \
+            --network extnet:external --network extnet 2>ext.err
+      - name: Valida extensiones (mount/network + encadenado del override)
+        run: |
+          cd "$RUNNER_TEMP/ext"
+          # el CTL/up debe encadenar AMBOS ficheros con -f
+          grep -q -- "-f compose.yaml -f compose.override.yaml" ext.err \
+            || { echo "FALLO: no se encadenó el override"; cat ext.err; exit 1; }
+          python3 - <<'PY'
+          import yaml
+          doc = yaml.safe_load(open("compose.yaml"))
+          svcs = doc["services"]
+          assert set(svcs) == {"runner-1", "runner-2"}, svcs
+          for name, s in svcs.items():
+              assert "sharedcache:/opt/cache" in s["volumes"], (name, s["volumes"])
+              assert "/var/run/foo.sock:/foo.sock:ro" in s["volumes"], (name, s["volumes"])
+              assert s["networks"] == ["default", "extnet"], (name, s.get("networks"))
+          assert "sharedcache" in doc["volumes"], doc["volumes"]
+          assert "/var/run/foo.sock" not in doc["volumes"], "el bind no debe declararse"
+          assert doc["networks"]["extnet"]["external"] is True, doc["networks"]
+          assert "default" in doc["networks"], doc["networks"]
+          print("extensiones OK:", list(doc["volumes"]), "| nets:", list(doc["networks"]))
+          PY

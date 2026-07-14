@@ -156,6 +156,9 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/JoseAmador95/gh_runner/mai
 | `--image REF` | Imagen (def. `ghcr.io/joseamador95/gh_runner:latest`) | `IMAGE` |
 | `--engine E` | Fuerza el motor: `podman` o `docker` (def. autodetecta) | — |
 | `--cache-dirs A,B` | Dirs extra de cache por runner (p.ej. `.npm,.cargo`) | — |
+| `--mount SRC:DST[:ro]` | Volumen/bind extra en **cada** runner (repetible). `SRC` = volumen nombrado (compartido) o ruta host (bind) | — |
+| `--network NAME[:external]` | Red extra en **cada** runner (repetible; para redes externas ya existentes) | — |
+| `--compose-extra FILE` | Override de compose a encadenar (autodetecta `compose.override.yaml`) | — |
 | `--cpus N` | Límite de CPU por runner (p.ej. `2`, `1.5`) | `RUNNER_CPUS` |
 | `--memory SIZE` | Límite de memoria por runner (p.ej. `2g`, `512m`) | `RUNNER_MEMORY` |
 | `--pull-always` | *(default)* `pull_policy: always`: cada `up -d` re-baja `:latest` | — |
@@ -259,10 +262,10 @@ Para **limpiar** el cache: `… down -v` (borra los volúmenes).
 
 El cuello de botella suele ser la red de los jobs, no el runner. Cómo aprovechar los volúmenes persistentes:
 
-- **`pnpm install` (el gran lever):** la imagen ya fija `npm_config_store_dir=/home/runner/_work/.pnpm-store`. El store queda **dentro de `_work`** → persiste entre jobs **y** está en el **mismo filesystem** que `node_modules` (`_work/<repo>`), así que pnpm instala por **hard-links, sin descargar**. (Si el store estuviera en otro volumen, pnpm *copiaría* en vez de enlazar — por eso va en `_work`, no en `.cache`.) Instala con `pnpm install --frozen-lockfile --prefer-offline`.
+- **`pnpm install` (el gran lever):** en **tu imagen derivada** (o el workflow) fija `npm_config_store_dir=/home/runner/_work/.pnpm-store` — gh_runner **no** lo hornea, por ser genérico (ver [Extender gh_runner](#extender-gh_runner-para-un-proyecto-imagen-derivada)). Al quedar **dentro de `_work`** el store persiste entre jobs **y** está en el **mismo filesystem** que `node_modules` (`_work/<repo>`), así que pnpm instala por **hard-links, sin descargar**. (En otro volumen pnpm *copiaría* en vez de enlazar — por eso va en `_work`, no en `.cache`.) Instala con `pnpm install --frozen-lockfile --prefer-offline`.
 - **Quita `actions/cache` (y `setup-node` con `cache: pnpm`):** en self-hosted esos pasos suben/bajan el store al *cache service* de GitHub (Azure) — lento y **redundante** con el store local. Ese es el paso **"post"** que ves; al quitarlo, desaparece.
 - **Clone:** el `.git` persiste en `_work` → `actions/checkout` hace *fetch* incremental (solo el 1er job por runner clona en frío). Mantén `fetch-depth` bajo.
-- **npm / yarn:** la imagen apunta el cache de npm a `.cache/npm` (volumen persistente). Para yarn u otros, persiste su cache con `--cache-dirs`.
+- **npm / yarn:** el base **no** redirige estos caches (por ser genérico). Persístelos con `--cache-dirs .npm` (npm usa `~/.npm`) o fija `npm_config_cache=/home/runner/.cache/npm` en tu imagen derivada.
 - **Opcional — registry local (Verdaccio):** un proxy *pull-through* compartido por los runners del host baja de npmjs **una vez** y cachea; acelera el arranque en frío y comparte cache entre runners sin el riesgo de corromper un store compartido. Corre Verdaccio en el host y apunta los jobs con `npm_config_registry=http://<host>:4873`.
 
 > El store en `_work` crece con el tiempo; acótalo con `pnpm store prune` (p.ej. dentro del `refresh.sh` periódico) o un `down -v` ocasional.
@@ -341,6 +344,58 @@ Estas las inyecta el `.env` / compose; normalmente no las tocas a mano:
 | `RUNNER_TOKEN` | no | **Legacy**: token de registro directo (caduca ~1 h; rompe el auto-reinicio). Solo si no hay `ACCESS_TOKEN`. |
 
 \* `ACCESS_TOKEN` es obligatorio salvo que lo pases como fichero (`ACCESS_TOKEN_FILE`/`--secret`) o uses el modo legacy `RUNNER_TOKEN`.
+
+---
+
+## Extender gh_runner para un proyecto (imagen derivada)
+
+`gh_runner` es un deployer **genérico**. Lo específico de un proyecto (toolchain, `ENV`, servicios sidecar, volúmenes/redes a medida) va en una **capa aparte**, sin tocar el base. Dos ejes:
+
+**1. Binarios/tooling → imagen derivada (`FROM`).** Crea un repo con un `Containerfile` que herede del base y añada lo tuyo:
+
+```dockerfile
+FROM ghcr.io/joseamador95/gh_runner:latest
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
+    && corepack enable && rm -rf /var/lib/apt/lists/*
+USER runner
+# El store de pnpm DEBE ir dentro de _work (mismo filesystem que node_modules →
+# instala por hard-links, sin descargar; ver §6). Esto NO va en el base genérico.
+ENV npm_config_store_dir=/home/runner/_work/.pnpm-store \
+    npm_config_cache=/home/runner/.cache/npm
+```
+
+Publícala en GHCR (multi-arch, como el base; con un `schedule` diario para heredar los arreglos del base) y despliega con `--image`:
+
+```bash
+sh deploy.sh --repo OWNER/REPO --image ghcr.io/OWNER/mi-runner:latest \
+    --labels mi-proyecto --count 3 --up
+```
+
+**2. Servicios/volúmenes/redes → `compose.override.yaml` + flags.**
+
+- **Sidecars (Verdaccio, Postgres…):** decláralos en un `compose.override.yaml` en el directorio del despliegue. `deploy.sh` (y `refresh.sh`) lo **autodetectan** y lo **encadenan** (`-f compose.yaml -f compose.override.yaml`); no lo generan ni lo pisan (lo posee tu proyecto). La **red por defecto** hace a los sidecars alcanzables **por nombre** desde los runners (`verdaccio:4873`), sin necesitar `--network`:
+
+  ```yaml
+  # compose.override.yaml
+  services:
+    verdaccio:
+      image: verdaccio/verdaccio:5
+      ports: ["4873:4873"]
+      volumes: [verdaccio-storage:/verdaccio/storage]
+  volumes:
+    verdaccio-storage: {}
+  ```
+
+- **Un volumen/bind en cada runner → `--mount SRC:DST[:ro]`** (repetible). Un `SRC` sin `/` es un **volumen nombrado compartido** entre todos los runners (útil para un cache read-mostly; para un store con escritura fuerte usa el `_work` por-runner, no un mount compartido); un `SRC` con ruta es un **bind**.
+- **Una red externa ya existente → `--network NAME[:external]`** (repetible). Solo para redes **fuera** del proyecto; los sidecars del propio override no la necesitan.
+
+```bash
+sh deploy.sh --repo OWNER/REPO --image ghcr.io/OWNER/mi-runner:latest \
+    --mount shared-cache:/opt/cache --network db-net:external --up
+```
+
+> `refresh.sh` (el recreate periódico que mantiene el runner al día) también encadena el `compose.override.yaml`, así que los sidecars/mounts sobreviven al recreate.
 
 ---
 
