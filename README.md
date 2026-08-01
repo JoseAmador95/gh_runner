@@ -392,6 +392,8 @@ $EDITOR 10-healthchecks.sh 20-telegram.sh        # pon la URL de ping y el token
 Los dos ejemplos hacen cosas **distintas y complementarias**:
 
 - **`10-healthchecks.sh` — el latido, el aviso por ausencia y el historial.** Es el único que cubre el fallo que la máquina no puede contar por sí misma: **que esté apagada o sin internet**. Nadie manda un aviso desde un host muerto. La vuelta es un **latido invertido**: mientras todo va bien la máquina hace ping cada ronda, y es el **servicio** quien avisa cuando el ping **deja de llegar**. Por eso ignora `VIGILAR_CAMBIO` a propósito: tiene que mandarse siempre. Va con prefijo `10-` para que un hook roto más abajo nunca retrase la señal de vida.
+
+  > De paso responde a **«¿quién vigila al vigía?»**. Si `vigilar.sh` revienta, el timer se para o alguien lo desactiva sin querer, tampoco sale el ping — y el aviso por ausencia salta igual que si la máquina hubiera muerto. Ninguna otra pieza puede dar esa garantía: cualquier cosa que dependa de que el host hable, calla justo cuando hace falta.
 - **`20-telegram.sh` — el mensaje legible.** Manda el informe completo al móvil, directo, y solo cuando algo cambia. Va aparte a propósito: así el mensaje que de verdad quieres leer no depende de cómo formatee un tercero.
 
 Sirve cualquier servicio de *heartbeat*; el ejemplo usa [healthchecks.io](https://healthchecks.io) porque tiene rutas separadas para «sigo viva» (`/uuid`) y «algo va mal» (`/uuid/fail`), enruta a Telegram/correo/Slack sin tocar código, y es **software libre y self-hostable** — la dependencia del tercero es reversible cambiando la URL.
