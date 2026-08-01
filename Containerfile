@@ -59,6 +59,23 @@ RUN /home/runner/bin/installdependencies.sh \
 USER runner
 
 COPY --chown=runner:runner entrypoint.sh /home/runner/entrypoint.sh
-RUN chmod +x /home/runner/entrypoint.sh
+COPY --chown=runner:runner healthcheck.sh /home/runner/healthcheck.sh
+RUN chmod +x /home/runner/entrypoint.sh /home/runner/healthcheck.sh
+
+# `restart: always` NO cubre el peor fallo de un runner: quedarse atascado sin
+# poder hablar con GitHub ("Retrying until reconnected", un bucle sin salida).
+# El proceso sigue vivo, así que el contenedor figura "Up" y no toma un solo job.
+# El healthcheck lo detecta leyendo el propio log del runner (ver healthcheck.sh).
+#
+# Va en la IMAGEN, no en el compose, a propósito: podman-compose "legacy" ignora
+# bloques del compose (ya pasa con `deploy:`), y ahí el fallo sería silencioso —
+# creerías tener vigilancia sin tenerla. La config de la imagen se respeta siempre.
+#
+# start-period generoso: el arranque puede incluir el backoff anti crash-loop del
+# entrypoint, que llega a minutos. retries=3 para no marcar en rojo un blip de red.
+# Para desactivarlo en un consumidor concreto: `healthcheck: {disable: true}` en
+# el compose (proveedores v2), o `--no-healthcheck` en `podman run`.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=180s --retries=3 \
+    CMD ["/home/runner/healthcheck.sh"]
 
 ENTRYPOINT ["/home/runner/entrypoint.sh"]

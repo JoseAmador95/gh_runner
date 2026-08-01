@@ -46,6 +46,10 @@ param(
     [switch]$SkipValidation,
     [switch]$Force,
     [switch]$NoBootstrap,
+    [switch]$Vigilar,
+    [string]$VigilarCada = '5min',
+    [string]$VigilarHooks,
+    [switch]$NoHostLabel,
     [switch]$Help
 )
 
@@ -61,6 +65,12 @@ $PSNativeCommandUseErrorActionPreference = $false
 $Marker     = '# GENERADO por deploy'   # prefijo común con deploy.sh
 $SecretFile = 'access_token'
 $ImageDefault = 'ghcr.io/joseamador95/gh_runner:latest'
+
+# Separador de la etiqueta de host. En UNA constante, igual que en deploy.sh: si
+# GitHub rechazara ':' en una etiqueta, config.sh fallaría y NINGÚN runner
+# arrancaría; cambiarlo a '-' es entonces una sola línea (en los dos ficheros).
+$HostLabelSep = ':'
+$RawBase = 'https://raw.githubusercontent.com/JoseAmador95/gh_runner/main'
 
 function Die($m)  { [Console]::Error.WriteLine("ERROR: $m"); exit 1 }
 function Info($m) { [Console]::Error.WriteLine($m) }
@@ -100,6 +110,15 @@ Despliegue:
 
 Seguridad:
   -Secret                Guarda el PAT como file-secret (.\access_token) en vez de en .env
+
+Vigilancia (opt-in):
+  -Vigilar               Instala el vigía: comprueba los runners cada pocos minutos
+                         y entrega un informe a tus hooks. Detecta el runner
+                         ATASCADO (sigue "Up" pero no toma jobs), el contenedor
+                         ausente y el reloj desfasado. Requiere Git Bash (sh.exe).
+  -VigilarCada N         Cadencia del vigía (por defecto 5min)
+  -VigilarHooks RUTA     Directorio de hooks (por defecto %APPDATA%\gh-runner\hooks.d)
+  -NoHostLabel           No añadir la etiqueta host:<hostname> a los runners
 
 Ejecución:
   -Up / -NoUp            Levantar o no el stack tras generar
@@ -343,6 +362,12 @@ if (-not $Secret) { $envText += "ACCESS_TOKEN=$Token`n" }
 $envText += "REPO_USER=$Owner`n"
 $envText += "REPO_NAME=$Name`n"
 if ($Labels) { $envText += "RUNNER_LABELS=$Labels`n" }
+# Etiqueta de host en su PROPIA variable, no concatenada a RUNNER_LABELS: el
+# entrypoint aplica un default (self-hosted,ubuntu-24.04) solo cuando esa viene
+# vacía, así que rellenarla aquí lo borraría y un `runs-on: [self-hosted,
+# ubuntu-24.04]` dejaría de casar. El entrypoint la suma a lo que haya.
+$hostLabel = if ($NoHostLabel) { '' } else { "host$HostLabelSep$hostShort" }
+if ($hostLabel) { $envText += "RUNNER_HOST_LABEL=$hostLabel`n" }
 if ($Group) { $envText += "RUNNER_GROUP=$Group`n" }
 Write-TextLf '.env' $envText
 Protect-File '.env'
@@ -419,6 +444,88 @@ function Invoke-Compose {
     & $exe @pre @args
 }
 
+# ---- Vigía del host (opt-in con -Vigilar) ----------------------------------
+# Trae al host lo que el compose no puede saber: si un runner está atascado, si
+# falta un contenedor y si el reloj se ha ido. `restart: always` no cubre nada de
+# eso: un runner en "Retrying until reconnected" tiene el proceso vivo, así que
+# el contenedor figura "Up" sin tomar un solo job.
+#
+# El vigía es vigilar.sh (POSIX sh), compartido con Linux/macOS a propósito: un
+# port a PowerShell sería una segunda implementación que se desincroniza. En
+# Windows lo ejecuta sh.exe de Git Bash, que es el mismo requisito que ya tiene
+# la ruta "Windows con Git Bash" del README.
+function Get-DelRepo($rel, $dest) {
+    if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot $rel))) {
+        Copy-Item (Join-Path $PSScriptRoot $rel) $dest -Force
+        return
+    }
+    try {
+        Invoke-WebRequest -Uri "$RawBase/$rel" -OutFile $dest -UseBasicParsing -ErrorAction Stop
+    } catch {
+        Die "no pude obtener $rel (ni junto al script ni desde $RawBase). Clona el repo y ejecuta deploy.ps1 desde ahí."
+    }
+}
+
+function Install-Vigia {
+    $deployDir = (Get-Location).ProviderPath
+    # $script: y no una asignación normal: dentro de una función eso crearía una
+    # variable LOCAL que tapa el parámetro, y el resumen de abajo saldría vacío.
+    if (-not $VigilarHooks) { $script:VigilarHooks = Join-Path $env:APPDATA 'gh-runner\hooks.d' }
+
+    # Cadencia -> minutos (Task Scheduler no entiende "5min").
+    $num = ($VigilarCada -replace '[^0-9]', '')
+    if (-not $num) { $num = '5' }
+    $minutos = [int]$num
+    if ($VigilarCada -match 'h$') { $minutos = $minutos * 60 }
+    elseif ($VigilarCada -match 's$') { $minutos = [Math]::Max(1, [int]($minutos / 60)) }
+    if ($minutos -lt 1) { $minutos = 5 }
+
+    Get-DelRepo 'vigilar.sh' (Join-Path $deployDir 'vigilar.sh')
+    Info "Escrito $deployDir\vigilar.sh"
+
+    # Los hooks son EJEMPLOS con sufijo .ejemplo: no se ejecutan hasta que los
+    # copias sin él. Así instalar el vigía nunca dispara un aviso a medio
+    # configurar, y repetir deploy.ps1 no pisa los que ya tengas puestos.
+    New-Item -ItemType Directory -Force -Path $VigilarHooks | Out-Null
+    foreach ($h in @('10-healthchecks.sh', '20-telegram.sh')) {
+        $dest = Join-Path $VigilarHooks "$h.ejemplo"
+        if (-not (Test-Path $dest)) { Get-DelRepo "hooks/$h.ejemplo" $dest }
+    }
+    Info "Hooks de ejemplo en $VigilarHooks (cópialos sin '.ejemplo' y edítalos para activarlos)."
+
+    $sh = (Get-Command 'sh.exe', 'bash.exe' -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if (-not $sh) {
+        Info ""
+        Info "AVISO: no encontré sh.exe/bash.exe (Git Bash), así que NO agendé el vigía."
+        Info "  Instala Git para Windows y vuelve a ejecutar con -Vigilar, o agenda a mano:"
+        Info "    sh.exe `"$deployDir\vigilar.sh`" --hooks `"$VigilarHooks`""
+        return
+    }
+
+    $accion  = New-ScheduledTaskAction -Execute $sh.Source `
+                   -Argument "`"$deployDir\vigilar.sh`" --hooks `"$VigilarHooks`"" `
+                   -WorkingDirectory $deployDir
+    $disparo = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+                   -RepetitionInterval (New-TimeSpan -Minutes $minutos)
+    try {
+        Register-ScheduledTask -TaskName 'gh-runner-vigilar' -Action $accion -Trigger $disparo `
+            -Description 'Vigia de los runners de GitHub Actions' -Force -ErrorAction Stop | Out-Null
+        Info "Vigía activo: tarea 'gh-runner-vigilar' cada $minutos min."
+        Info "  Comprobar ahora : Start-ScheduledTask -TaskName gh-runner-vigilar"
+        Info "  Ver el informe  : sh.exe `"$deployDir\vigilar.sh`" --informe"
+    } catch {
+        Info ""
+        Info "AVISO: no pude registrar la tarea ($($_.Exception.Message)). Créala a mano:"
+        Info "  schtasks /Create /TN gh-runner-vigilar /SC MINUTE /MO $minutos ``"
+        Info "    /TR `"'$($sh.Source)' '$deployDir\vigilar.sh' --hooks '$VigilarHooks'`""
+    }
+}
+
+if ($Vigilar) {
+    Info ""
+    Install-Vigia
+}
+
 # ---- Resumen ---------------------------------------------------------------
 Info ""
 Info "Resumen:"
@@ -428,7 +535,11 @@ Info "  Imagen  : $Image"
 Info "  Token   : $tokenSrc"
 if ($Secret) { Info "  PAT     : file-secret (.\$SecretFile)" } else { Info "  PAT     : en .env" }
 if ($Cpus -or $Memory) { Info "  Límites : cpus=$(if($Cpus){$Cpus}else{'—'}) memoria=$(if($Memory){$Memory}else{'—'})" }
+$etiquetas = @($Labels, $hostLabel) | Where-Object { $_ }
+if ($etiquetas) { Info "  Etiquetas: $($etiquetas -join ',')" }
 Info "  Motor   : $EngineName ($composeDisplay)"
+if ($Vigilar) { Info "  Vigía   : cada $VigilarCada, hooks en $VigilarHooks" }
+else { Info "  Vigía   : no (-Vigilar lo instala: avisa si un runner se atasca o se cae)" }
 
 # ---- Levantar el stack -----------------------------------------------------
 $doUp = if ($NoUp) { $false } elseif ($Up) { $true } else { $Interactive }

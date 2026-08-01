@@ -61,6 +61,27 @@ SECRET_FILE="access_token"
 ENGINE_PREF=""      # --engine: forzar podman o docker
 BOOTSTRAP="yes"     # instalar podman/compose y crear la machine si faltan (opt-out --no-bootstrap)
 PM=""; MACHINE="no" # los rellena bootstrap_env (gestor de paquetes / si hay VM)
+VIGILAR="no"        # --vigilar: instala el vigía (timer + hooks) en el host
+VIGILAR_CADA="5min" # cadencia del timer del vigía
+VIGILAR_HOOKS=""    # directorio de hooks del vigía (por defecto, bajo XDG_CONFIG_HOME)
+HOST_LABEL="yes"    # añade la etiqueta host:<hostname> a los runners (opt-out --no-host-label)
+
+# Separador de la etiqueta de host. En UNA constante a propósito: si GitHub
+# rechazara ':' en una etiqueta, config.sh fallaría y NINGÚN runner arrancaría;
+# cambiarlo a '-' es entonces una sola línea.
+HOST_LABEL_SEP=":"
+
+# Base para descargar piezas del repo cuando deploy.sh se ejecuta por curl y no
+# tiene ficheros hermanos en disco.
+RAW_BASE="https://raw.githubusercontent.com/JoseAmador95/gh_runner/main"
+
+# Directorio del propio deploy.sh, SI se está ejecutando desde un fichero. Con
+# `sh -c "$(curl …)"` o por tubería, $0 es "sh" y no hay hermanos en disco: queda
+# vacío y quien lo necesite baja del repo.
+_DIR_SCRIPT=""
+case "$0" in
+    */*) [ -f "$0" ] && _DIR_SCRIPT="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" ;;
+esac
 
 # ---- Utilidades ------------------------------------------------------------
 err()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -203,6 +224,15 @@ Seguridad:
                          proveedor de compose soporte 'secrets:' (ver README).
   --token-in-env         Fuerza el modo por defecto (PAT en .env).
 
+Vigilancia (opt-in):
+  --vigilar              Instala el vigía en el host: comprueba los runners cada
+                         pocos minutos y entrega un informe a tus hooks (avisos).
+                         Detecta el runner ATASCADO (el que sigue "Up" pero no
+                         toma jobs), el contenedor ausente y el reloj desfasado.
+  --vigilar-cada N       Cadencia del vigía (por defecto 5min; p.ej. 2min, 15min)
+  --vigilar-hooks RUTA   Directorio de hooks (por defecto ~/.config/gh-runner/hooks.d)
+  --no-host-label        No añadir la etiqueta host:<hostname> a los runners
+
 Ejecución:
   --up                   Levanta el stack tras generar el compose
   --no-up                No lo levanta (solo genera los ficheros)
@@ -244,6 +274,11 @@ while [ "$#" -gt 0 ]; do
         --skip-validation) SKIP_VALIDATION="yes"; shift ;;
         --force)       FORCE="yes"; shift ;;
         --no-bootstrap) BOOTSTRAP="no"; shift ;;
+        --vigilar)     VIGILAR="yes"; shift ;;
+        --no-vigilar)  VIGILAR="no"; shift ;;
+        --vigilar-cada)  VIGILAR_CADA="${2:?}"; shift 2 ;;
+        --vigilar-hooks) VIGILAR_HOOKS="${2:?}"; shift 2 ;;
+        --no-host-label) HOST_LABEL="no"; shift ;;
         -h|--help)     usage 0 ;;
         *) err "opción desconocida: $1 (usa --help)" ;;
     esac
@@ -394,6 +429,20 @@ HOST="${HOST%%.*}"
 HOST="$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9_-' '-')"
 [ -n "$HOST" ] || HOST="runner"
 
+# ---- Etiqueta de host ------------------------------------------------------
+# Hasta ahora el único rastro de en qué máquina vive un runner era su NOMBRE, y
+# parsearlo no es fiable: el saneado de arriba CONSERVA guiones y el prefijo es
+# libre, así que en "mi-prefijo-mi-host-3" no hay forma de saber dónde acaba uno
+# y empieza el otro. Con una etiqueta el dato es explícito.
+#
+# Va en su PROPIA variable y no concatenada a RUNNER_LABELS: el entrypoint aplica
+# un default (`self-hosted,ubuntu-24.04`) solo cuando RUNNER_LABELS viene vacía,
+# así que rellenarla aquí lo BORRARÍA y un `runs-on: [self-hosted, ubuntu-24.04]`
+# dejaría de casar. El entrypoint la añade encima de lo que haya, que es lo que
+# hace la etiqueta de verdad aditiva. $HOST ya viene saneado arriba.
+HOST_LABEL_VALUE=""
+[ "$HOST_LABEL" = "yes" ] && HOST_LABEL_VALUE="host${HOST_LABEL_SEP}${HOST}"
+
 # ---- No pisar ficheros ajenos ---------------------------------------------
 guard_overwrite "$ENV_FILE"
 guard_overwrite "$COMPOSE_FILE"
@@ -416,6 +465,7 @@ fi
     printf 'REPO_USER=%s\n' "$OWNER"
     printf 'REPO_NAME=%s\n' "$NAME"
     [ -n "$LABELS" ] && printf 'RUNNER_LABELS=%s\n' "$LABELS"
+    [ -n "$HOST_LABEL_VALUE" ] && printf 'RUNNER_HOST_LABEL=%s\n' "$HOST_LABEL_VALUE"
     [ -n "$GROUP" ]  && printf 'RUNNER_GROUP=%s\n' "$GROUP"
     :
 } > "$ENV_FILE"
@@ -507,6 +557,124 @@ vol_suffix() { printf '%s' "$1" | tr -cd 'A-Za-z0-9'; }
 } > "$COMPOSE_FILE"
 info "Escrito $COMPOSE_FILE con $COUNT runner(s)."
 
+# ---- Vigía del host (opt-in con --vigilar) ---------------------------------
+# Trae al host lo que el compose no puede saber: si un runner está atascado, si
+# falta un contenedor y si el reloj se ha ido. `restart: always` no cubre nada de
+# eso — un runner en "Retrying until reconnected" tiene el proceso vivo.
+# El vigía NO maneja secretos: entrega el informe a los hooks y cada hook guarda
+# el suyo. Es deliberado: el .env se inyecta en contenedores que ejecutan código
+# arbitrario de CI, así que un token ahí sería una fuga.
+
+# Copia un fichero del repo al directorio del despliegue: si deploy.sh se está
+# ejecutando desde un clon, lo coge del hermano; si vino por curl (sin ficheros
+# en disco), lo baja.
+traer_del_repo() {  # $1 = ruta relativa en el repo, $2 = destino
+    if [ -n "${_DIR_SCRIPT:-}" ] && [ -f "${_DIR_SCRIPT}/$1" ]; then
+        # Si el despliegue ES el propio clon, origen y destino son el mismo
+        # fichero y `cp` aborta ("are the same file"). No hay nada que copiar.
+        [ "${_DIR_SCRIPT}/$1" = "$2" ] && return 0
+        cp "${_DIR_SCRIPT}/$1" "$2"
+        return 0
+    fi
+    command -v curl >/dev/null 2>&1 || err "necesito 'curl' para bajar $1 (o corre deploy.sh desde un clon del repo)."
+    curl -fsSL "${RAW_BASE}/$1" -o "$2" || err "no pude bajar $1 desde ${RAW_BASE}.
+       Clona el repo y corre deploy.sh desde ahí: coge los ficheros del clon en vez de bajarlos."
+}
+
+instalar_vigia() {
+    _dir_deploy="$(pwd)"
+    [ -n "$VIGILAR_HOOKS" ] || VIGILAR_HOOKS="${XDG_CONFIG_HOME:-$HOME/.config}/gh-runner/hooks.d"
+
+    case "$VIGILAR_CADA" in
+        ''|*[!0-9a-z]*) err "--vigilar-cada debe ser una duración de systemd (5min, 30s, 1h)" ;;
+    esac
+
+    traer_del_repo vigilar.sh "${_dir_deploy}/vigilar.sh"
+    chmod +x "${_dir_deploy}/vigilar.sh"
+    info "Escrito ${_dir_deploy}/vigilar.sh"
+
+    # Los hooks son EJEMPLOS con sufijo .ejemplo: no se ejecutan hasta que los
+    # copias sin él. Así instalar el vigía nunca dispara un aviso a medio
+    # configurar, y volver a correr deploy.sh no pisa los que ya tengas puestos.
+    mkdir -p "$VIGILAR_HOOKS"
+    chmod 700 "$VIGILAR_HOOKS" 2>/dev/null || true
+    for _h in 10-healthchecks.sh 20-telegram.sh; do
+        if [ ! -e "${VIGILAR_HOOKS}/${_h}.ejemplo" ]; then
+            traer_del_repo "hooks/${_h}.ejemplo" "${VIGILAR_HOOKS}/${_h}.ejemplo"
+        fi
+    done
+    info "Hooks de ejemplo en ${VIGILAR_HOOKS} (cópialos sin '.ejemplo' y edítalos para activarlos)."
+
+    # ¿Hay systemd de usuario? Es lo que el README ya usa para refresh.sh y para
+    # podman-restart.service, así que no se introduce ninguna convención nueva.
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+        _units="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+        mkdir -p "$_units"
+        cat > "${_units}/gh-runner-vigilar.service" <<EOF
+${MARKER}.sh — no editar a mano.
+[Unit]
+Description=Vigia de los runners de GitHub Actions
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${_dir_deploy}
+ExecStart=${_dir_deploy}/vigilar.sh --hooks ${VIGILAR_HOOKS}
+EOF
+        cat > "${_units}/gh-runner-vigilar.timer" <<EOF
+${MARKER}.sh — no editar a mano.
+[Unit]
+Description=Ronda del vigia de runners cada ${VIGILAR_CADA}
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${VIGILAR_CADA}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl --user daemon-reload
+        systemctl --user enable --now gh-runner-vigilar.timer
+        # Sin linger, el timer muere al cerrar sesión. El README ya lo exige para
+        # podman-restart.service; se intenta aquí y si no se puede, se avisa.
+        if command -v loginctl >/dev/null 2>&1; then
+            loginctl enable-linger "$(id -un)" 2>/dev/null \
+                || info "AVISO: no pude activar linger. Ejecuta: loginctl enable-linger $(id -un)"
+        fi
+        info "Vigía activo: timer gh-runner-vigilar.timer cada ${VIGILAR_CADA}."
+        info "  Comprobar ahora : systemctl --user start gh-runner-vigilar.service"
+        info "  Ver el informe  : ${_dir_deploy}/vigilar.sh --informe"
+    else
+        # La cadencia en minutos para el ejemplo de cron/launchd (systemd acepta
+        # "5min", cron no). Si no se puede deducir, se cae a 5.
+        _min="$(printf '%s' "$VIGILAR_CADA" | tr -cd '0-9')"
+        case "$VIGILAR_CADA" in
+            *h) _min=$(( ${_min:-1} * 60 )) ;;
+            *s) _min=$(( ${_min:-300} / 60 )); [ "$_min" -lt 1 ] && _min=1 ;;
+        esac
+        [ -n "$_min" ] && [ "$_min" -ge 1 ] 2>/dev/null || _min=5
+        # El campo de minutos de cron es 0-59: un "*/90" no dispara cada 90 min,
+        # dispara en el minuto 0 y engaña. A partir de una hora se pasa a horas.
+        if [ "$_min" -ge 60 ]; then
+            _cron="0 */$(( _min / 60 )) * * *"
+        else
+            _cron="*/${_min} * * * *"
+        fi
+        info ""
+        info "AVISO: no hay systemd de usuario, así que NO agendé el vigía. Agéndalo tú:"
+        info "  cron:      ${_cron} cd ${_dir_deploy} && ./vigilar.sh --hooks ${VIGILAR_HOOKS}"
+        info "  macOS:     un agente launchd con StartInterval=$(( _min * 60 )) que corra ./vigilar.sh"
+        info "  Windows:   una tarea de Task Scheduler cada ${_min} min sobre vigilar.sh"
+        info "  Pruébalo:  ${_dir_deploy}/vigilar.sh --informe"
+    fi
+}
+
+if [ "$VIGILAR" = "yes" ]; then
+    info ""
+    instalar_vigia
+fi
+
 # ---- Resumen ---------------------------------------------------------------
 info ""
 info "Resumen:"
@@ -520,7 +688,20 @@ else
     info "  PAT     : en ${ENV_FILE}"
 fi
 [ -n "$CPUS$MEMORY" ] && info "  Límites : cpus=${CPUS:-—} memoria=${MEMORY:-—}"
+# Lo que el runner recibirá de verdad: --labels MÁS la etiqueta de host, que
+# viaja aparte. Enseñar solo una de las dos daría una idea equivocada.
+_labels_efectivas="$LABELS"
+if [ -n "$HOST_LABEL_VALUE" ]; then
+    [ -n "$_labels_efectivas" ] && _labels_efectivas="${_labels_efectivas},"
+    _labels_efectivas="${_labels_efectivas}${HOST_LABEL_VALUE}"
+fi
+[ -n "$_labels_efectivas" ] && info "  Etiquetas: ${_labels_efectivas}"
 info "  Motor   : ${ENGINE} (${COMPOSE})"
+if [ "$VIGILAR" = "yes" ]; then
+    info "  Vigía   : cada ${VIGILAR_CADA}, hooks en ${VIGILAR_HOOKS}"
+else
+    info "  Vigía   : no (--vigilar lo instala: avisa si un runner se atasca o se cae)"
+fi
 
 # ---- Comandos de control ---------------------------------------------------
 # Con el nombre autodetectado (compose.yaml, etc.) no hace falta -f.

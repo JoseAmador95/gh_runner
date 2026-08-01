@@ -167,9 +167,15 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/JoseAmador95/gh_runner/mai
 | `--skip-validation` | No validar el token contra la API | — |
 | `--force` | Sobreescribe `compose.yaml`/`.env`/`access_token` ajenos | — |
 | `--no-bootstrap` | No instalar podman/compose ni crear la machine | — |
+| `--vigilar` | Instala el vigía del host: avisa si un runner se cae o se **atasca** (ver §9) | — |
+| `--vigilar-cada N` | Cadencia del vigía (def. `5min`) | — |
+| `--vigilar-hooks RUTA` | Directorio de hooks del vigía (def. `~/.config/gh-runner/hooks.d`) | — |
+| `--no-host-label` | No añadir la etiqueta `host:<hostname>` | — |
 | `-h`, `--help` | Ayuda | — |
 
 > GitHub añade **automáticamente** las etiquetas `self-hosted`, `Linux` y la arquitectura (`X64`/`ARM64`). `--labels` es solo para etiquetas **extra** (p.ej. `gpu`, `mi-proyecto`).
+
+> **Etiqueta `host:<hostname>`** (automática, quítala con `--no-host-label`): dice en **qué máquina** vive cada runner. Antes el único rastro era el **nombre** (`prefijo-host-N`) y parsearlo no es fiable, porque el saneado del hostname conserva guiones y el prefijo es libre: en `mi-prefijo-mi-host-3` no hay forma de saber dónde acaba uno y empieza el otro. Es **aditiva** — se suma a `--labels` (y al default), así que un `runs-on` que ya funcionaba sigue casando.
 
 ---
 
@@ -261,7 +267,9 @@ Para **limpiar** el cache: `… down -v` (borra los volúmenes).
 
 El compose usa `restart: always`: si un contenedor se cae, el motor lo recrea, **genera un token nuevo** y se re-registra en segundos.
 
-⚠️ `restart: always` solo actúa **mientras el motor de contenedores está corriendo**. Para que los runners vuelvan tras **reiniciar la máquina**:
+⚠️ **`restart: always` no cubre el runner *atascado*.** Solo actúa cuando el proceso **muere**. Un runner que pierde la conexión con GitHub entra en `Retrying until reconnected` con el proceso **vivo**: el contenedor figura `Up`, no toma un solo job y nadie se entera. Para eso está el vigía — **§9**.
+
+⚠️ `restart: always` tampoco actúa si el **motor de contenedores** no está corriendo. Para que los runners vuelvan tras **reiniciar la máquina**:
 
 - **macOS:** la `podman machine` debe arrancar sola. Configúrala como *login item* o arráncala al iniciar sesión (`podman machine start`).
 - **Linux (Podman rootless):**
@@ -311,6 +319,104 @@ Por defecto el PAT va en `.env` (chmod 600, gitignored). Con **`--secret`**, `de
 
 ---
 
+## 9. Vigilancia: enterarte cuando un runner se cae (opt-in)
+
+`restart: always` no cubre el peor fallo. Un runner puede quedarse **atascado sin poder hablar con GitHub** —entra en `Retrying until reconnected`, un bucle del que no sale— y como el proceso sigue vivo, el contenedor figura **`Up`** y **no toma un solo job**. En `podman compose ps` todo se ve bien.
+
+Caso real que motivó esto: el reloj del host iba **32 minutos atrasado**, así que el runner renovaba su credencial tarde siempre y GitHub la rechazaba. Los jobs se quedaron **en cola durante horas** sin que nadie se enterara: no hay factura que se dispare ni corrida en rojo que lo delate.
+
+```bash
+… deploy.sh … --vigilar          # instálalo al desplegar (o vuelve a ejecutarlo con --vigilar)
+```
+
+Eso deja tres piezas:
+
+| Pieza | Dónde | Qué hace |
+|---|---|---|
+| `HEALTHCHECK` | en la **imagen** | Lee el log del propio runner y lo marca `unhealthy` cuando está atascado |
+| `vigilar.sh` | en el **host**, con un timer | Cada 5 min compone un informe: atascados, ausentes y desfase de reloj |
+| Hooks | `~/.config/gh-runner/hooks.d` | Deciden **cómo** te avisan. Reciben el informe completo |
+
+El vigía **no repara nada**: diagnostica y avisa. Y **no toca el `compose.yaml`** —ni un servicio extra, ni un volumen, ni el socket de podman montado—, así que activarlo no puede romper un despliegue que ya funciona.
+
+### Qué detecta
+
+| Fallo | Cómo se detecta | Latencia |
+|---|---|---|
+| Runner **atascado** (sigue `Up`, no toma jobs) | `HEALTHCHECK` → timer | ≤ 6 min |
+| Contenedor **ausente** o parado | El timer no lo encuentra | ≤ 5 min |
+| **Reloj desfasado** (la causa raíz del caso de arriba) | Se compara con la hora de GitHub | ≤ 5 min |
+| **Máquina apagada o sin internet** | Por **ausencia de latido** (ver abajo) | el umbral que pongas |
+
+El informe se ve en cualquier momento sin esperar al timer:
+
+```bash
+./vigilar.sh --informe
+```
+
+```text
+Fleet mmJA — 5/7 en línea
+
+DEGRADADO
+  sherman-mmJA-2   atascado   atascado reconectando con GitHub
+  sherman-mmJA-4   ausente    no hay contenedor
+
+EN LÍNEA
+  sherman-mmJA-1   sano       ocupado
+  sherman-mmJA-3   sano       libre
+
+Reloj: +2 s vs GitHub
+Comprobado: 2026-08-01 15:04:12Z
+```
+
+### Los hooks: tú decides cómo te avisa
+
+`vigilar.sh` **no habla con ningún servicio**. Ejecuta todo lo que sea ejecutable en el directorio de hooks (convención *run-parts*, la de `cron.d` y los hooks de git), en orden alfabético, y les pasa:
+
+- el **informe completo** por **stdin**;
+- `VIGILAR_ESTADO` (`sano` / `degradado`), `VIGILAR_CAMBIO` (`si` / `no`, ¿cambió respecto a la ronda anterior?), `VIGILAR_CAIDOS`, `VIGILAR_HOST`, `VIGILAR_ONLINE`, `VIGILAR_ESPERADOS`.
+
+Los hooks corren en **cada** ronda; cada uno decide si le importa el cambio. Así el anti-spam vive en un solo sitio y los hooks son de tres líneas. Un hook que falle o se cuelgue **no impide** a los demás ni rompe el timer.
+
+> **Ningún secreto vive en `vigilar.sh`.** Cada hook guarda el suyo, en su fichero, con sus permisos (`chmod 700`). Es deliberado: el `.env` se inyecta en contenedores que ejecutan **código arbitrario de CI**, y cualquier job puede leer su propio entorno. Un token de bot ahí sería una fuga.
+
+`--vigilar` deja dos ejemplos listos. Se activan copiándolos **sin** el sufijo `.ejemplo` y rellenando sus datos:
+
+```bash
+cd ~/.config/gh-runner/hooks.d
+cp 10-healthchecks.sh.ejemplo 10-healthchecks.sh && chmod 700 10-healthchecks.sh
+cp 20-telegram.sh.ejemplo     20-telegram.sh     && chmod 700 20-telegram.sh
+$EDITOR 10-healthchecks.sh 20-telegram.sh        # pon la URL de ping y el token del bot
+```
+
+Los dos ejemplos hacen cosas **distintas y complementarias**:
+
+- **`10-healthchecks.sh` — el latido, el aviso por ausencia y el historial.** Es el único que cubre el fallo que la máquina no puede contar por sí misma: **que esté apagada o sin internet**. Nadie manda un aviso desde un host muerto. La vuelta es un **latido invertido**: mientras todo va bien la máquina hace ping cada ronda, y es el **servicio** quien avisa cuando el ping **deja de llegar**. Por eso ignora `VIGILAR_CAMBIO` a propósito: tiene que mandarse siempre. Va con prefijo `10-` para que un hook roto más abajo nunca retrase la señal de vida.
+- **`20-telegram.sh` — el mensaje legible.** Manda el informe completo al móvil, directo, y solo cuando algo cambia. Va aparte a propósito: así el mensaje que de verdad quieres leer no depende de cómo formatee un tercero.
+
+Sirve cualquier servicio de *heartbeat*; el ejemplo usa [healthchecks.io](https://healthchecks.io) porque tiene rutas separadas para «sigo viva» (`/uuid`) y «algo va mal» (`/uuid/fail`), enruta a Telegram/correo/Slack sin tocar código, y es **software libre y self-hostable** — la dependencia del tercero es reversible cambiando la URL.
+
+Un hook propio es un script que lee stdin:
+
+```sh
+#!/bin/sh
+[ "$VIGILAR_CAMBIO" = "si" ] || exit 0     # solo cuando algo cambia
+cat | mail -s "Runners de $VIGILAR_HOST: $VIGILAR_ESTADO" yo@ejemplo.com
+```
+
+### Requisitos y ajustes
+
+- **Linux:** el timer es una unidad **de usuario**, igual que `refresh.sh` (§7). Necesita `loginctl enable-linger "$USER"` —que este README ya exige para `podman-restart.service`—; `deploy.sh --vigilar` lo intenta activar solo.
+  ```bash
+  systemctl --user status gh-runner-vigilar.timer   # ver el timer
+  systemctl --user start  gh-runner-vigilar.service # forzar una ronda
+  ```
+- **macOS / Windows:** no hay systemd de usuario; `--vigilar` deja los ficheros listos e **imprime** la línea de `cron`, `launchd` o Task Scheduler que toca. En Windows, `vigilar.sh` lo ejecuta `sh.exe` de Git Bash (`deploy.ps1 -Vigilar` registra la tarea si lo encuentra).
+- **Healthchecks de podman rootless:** podman los implementa con *timers* transitorios de systemd. Si tu entorno no los soporta, el informe dirá `sin check` en vez de `sano` y **no** lo tratará como fallo: seguirás detectando contenedores ausentes y el reloj, pero no el atasco. Para desactivarlos del todo: `healthcheck: {disable: true}` en el compose.
+- **Umbral del reloj:** por defecto avisa a partir de 60 s de desfase (`--desfase-max N` en `vigilar.sh`). Está muy por encima de lo que deja cualquier NTP sano, así que no da falsos avisos — y muy por debajo de lo que rompe un runner.
+
+---
+
 ## Referencia: variables del contenedor
 
 Estas las inyecta el `.env` / compose; normalmente no las tocas a mano:
@@ -323,6 +429,7 @@ Estas las inyecta el `.env` / compose; normalmente no las tocas a mano:
 | `REPO_NAME` | sí | Nombre del repo |
 | `RUNNER_NAME` | no | Nombre del runner (def. `hostname-owner-repo`) |
 | `RUNNER_LABELS` | no | Etiquetas extra (def. `self-hosted,ubuntu-24.04`) |
+| `RUNNER_HOST_LABEL` | no | Etiqueta de máquina (`host:mi-equipo`), la pone `deploy.sh`. Va **aparte** de `RUNNER_LABELS` a propósito: si fuera dentro, borraría el default de arriba en los despliegues sin `--labels` y un `runs-on: [self-hosted, ubuntu-24.04]` dejaría de casar. El entrypoint la **suma** a lo que haya. |
 | `RUNNER_GROUP` | no | Runner group |
 | `RUNNER_DISABLE_UPDATE` | no | Desactiva el auto-update del runner dentro del contenedor (def. `yes`). Un self-update a mitad de job cancela el job y, al ser efímero, puede dejarlo en crash-loop; la imagen ya trae la última versión (rebuild diario). Pon `no` (o `0`) para reactivar el self-update. |
 | `GITHUB_API_URL` | no | Base de la API (def. `https://api.github.com`; útil en GHES) |
