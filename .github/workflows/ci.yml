@@ -36,7 +36,7 @@ jobs:
   vigia:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Los hooks acaban en .ejemplo, así que la acción de shellcheck no los
       # detecta por extensión; se analizan aquí explícitamente.
@@ -103,6 +103,38 @@ jobs:
           printf '[%sZ ERR  Worker] Runner connect error: falla el JOB\n' "$ahora" > "$d/_diag/Worker_y.log"
           printf '[%sZ INFO Listener] Listening for Jobs\n' "$ahora" > "$d/_diag/Runner_x.log"
           probar 0 'un job que falla NO es un runner enfermo'
+
+      # Un motor instalado pero PARADO (podman machine sin arrancar en macOS,
+      # daemon de Docker caído) devolvía vacío en cada consulta, y el informe
+      # decía que TODOS los runners habían desaparecido: diagnóstico equivocado,
+      # porque lo que hay que arrancar es el motor. Un vigía que da falsas
+      # alarmas se acaba silenciando, así que esto se fija.
+      - name: Motor parado se distingue de runners caídos
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/motor"; rm -rf "$d"; mkdir -p "$d/bin"
+          sh ./deploy.sh --no-up --skip-validation --token FAKE --repo o/r --count 3 >/dev/null 2>&1
+          cp compose.yaml "$d/compose.yaml"
+          # Motor presente pero que no responde a nada.
+          printf '#!/bin/sh\nexit 1\n' > "$d/bin/podman"; chmod +x "$d/bin/podman"
+
+          cd "$d"
+          informe="$(PATH="$d/bin:$PATH" sh "$GITHUB_WORKSPACE/vigilar.sh" --informe)"
+          echo "$informe"
+          echo "$informe" | grep -q 'NO SE PUEDE COMPROBAR' \
+            || { echo "FALLO: no detectó que el motor no responde"; exit 1; }
+          echo "$informe" | grep -qi 'ausente' \
+            && { echo "FALLO: culpa a los runners de que el motor esté parado"; exit 1; }
+          echo "ok: distingue 'no puedo preguntar' de 'no están'"
+
+          # Y tiene que AVISAR igual: callarse aquí sería lo peor de los dos mundos.
+          mkdir -p hooks
+          printf '#!/bin/sh\ncat > %s/recibido.txt\n' "$d" > hooks/10-captura
+          chmod +x hooks/10-captura
+          PATH="$d/bin:$PATH" sh "$GITHUB_WORKSPACE/vigilar.sh" --hooks "$d/hooks" --estado "$d/e" >/dev/null 2>&1
+          grep -q 'NO SE PUEDE COMPROBAR' recibido.txt \
+            || { echo "FALLO: no avisó con el motor parado"; exit 1; }
+          echo "ok: avisa, y el aviso dice qué arreglar"
 
       - name: vigilar.sh informa, dispara los hooks y no se repite
         run: |

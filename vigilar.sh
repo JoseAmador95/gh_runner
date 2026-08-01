@@ -70,6 +70,15 @@ for _eng in podman docker; do
 done
 [ -n "$ENGINE" ] || err "no encontré 'podman' ni 'docker' en el PATH."
 
+# ¿Además de existir, RESPONDE? No es lo mismo: el binario puede estar instalado
+# con el servicio parado (una `podman machine` que no arrancó al iniciar sesión
+# en macOS, el daemon de Docker caído). Sin esta comprobación, cada consulta
+# devolvería vacío y el informe diría que TODOS los runners desaparecieron —
+# diagnóstico equivocado, porque lo que hay que arrancar es el motor, no los
+# runners. Y un vigía que da falsas alarmas se acaba silenciando.
+MOTOR_VIVO="si"
+"$ENGINE" ps -q >/dev/null 2>&1 || MOTOR_VIVO="no"
+
 # Nombre de proyecto de compose: por defecto el del directorio, saneado igual
 # que lo hacen docker compose / podman-compose (minúsculas, solo [a-z0-9_-]).
 if [ -z "$PROYECTO" ]; then
@@ -159,10 +168,16 @@ ANCHO="$(printf '%s\n' "$SERVICIOS" | cut -f2 \
 
 # `IFS=$(printf '\t')` y no una tubería: el bucle debe correr en ESTE shell o
 # las variables acumuladas se perderían con el subshell.
+# Con el motor muerto no se recorre nada: cada servicio dispararía tres consultas
+# que fallan (y con un socket roto, fallar puede tardar), para un resultado que
+# de todas formas se descarta más abajo.
+_A_RECORRER="$SERVICIOS"
+[ "$MOTOR_VIVO" = "no" ] && _A_RECORRER=""
+
 OLDIFS="$IFS"
 IFS='
 '
-for _linea in $SERVICIOS; do
+for _linea in $_A_RECORRER; do
     IFS="$OLDIFS"
     _svc="${_linea%%	*}"
     _nombre="${_linea#*	}"
@@ -232,6 +247,19 @@ CAIDOS="${CAIDOS# }"
 ESTADO="sano"
 [ -n "$CAIDOS" ] && ESTADO="degradado"
 
+# El motor caído es degradado —con podman parado los runners tampoco corren—,
+# pero se nombra aparte para que el aviso diga QUÉ arreglar. La lista de
+# "ausentes" de arriba no significa nada en este caso: se descarta entera, o el
+# mensaje culparía a los runners de un problema que no es suyo.
+if [ "$MOTOR_VIVO" = "no" ]; then
+    ESTADO="degradado"
+    DEGRADADOS=""
+    SANOS=""
+    ONLINE=0
+    CAIDOS="motor:$ENGINE"
+    HUELLA="motor=$ENGINE-caido;"
+fi
+
 AVISO_RELOJ=""
 if [ -n "$DESFASE" ]; then
     _abs="$DESFASE"; [ "$_abs" -lt 0 ] && _abs=$(( -_abs ))
@@ -246,22 +274,39 @@ fi
 HOSTNAME_CORTO="$(hostname 2>/dev/null || echo host)"
 HOSTNAME_CORTO="${HOSTNAME_CORTO%%.*}"
 
+# OJO: `{ … }` es un grupo en ESTE shell, no un subshell. Un `exit` aquí dentro
+# cortaría el script entero y NO se mandaría el aviso — justo lo contrario de lo
+# que hace falta cuando algo va mal. De ahí que las dos formas del informe vayan
+# en un if/else y no en una salida temprana.
 {
-    printf 'Fleet %s — %s/%s en línea\n' "$HOSTNAME_CORTO" "$ONLINE" "$ESPERADOS"
-    if [ -n "$DEGRADADOS" ]; then
-        printf '\nDEGRADADO\n%s' "$DEGRADADOS"
-    fi
-    if [ -n "$SANOS" ]; then
-        printf '\nEN LÍNEA\n%s' "$SANOS"
-    fi
-    printf '\n'
-    if [ -n "$DESFASE" ]; then
-        printf 'Reloj: %+d s vs GitHub\n' "$DESFASE"
-        [ -n "$AVISO_RELOJ" ] && printf '%s\n' "$AVISO_RELOJ"
+    if [ "$MOTOR_VIVO" = "no" ]; then
+        printf 'Fleet %s — NO SE PUEDE COMPROBAR\n\n' "$HOSTNAME_CORTO"
+        printf '  %s está instalado pero no responde.\n' "$ENGINE"
+        printf '  Con el motor parado los runners tampoco corren, pero lo que hay\n'
+        printf '  que arrancar es el motor, no los runners:\n'
+        if [ "$(uname -s 2>/dev/null || echo)" = "Darwin" ]; then
+            printf '    podman machine start\n'
+        else
+            printf '    systemctl --user start podman.socket   (o arranca Docker)\n'
+        fi
+        printf '\nComprobado: %s\n' "$(date -u '+%Y-%m-%d %H:%M:%SZ')"
     else
-        printf 'Reloj: no medido (sin red o sin `date` compatible)\n'
+        printf 'Fleet %s — %s/%s en línea\n' "$HOSTNAME_CORTO" "$ONLINE" "$ESPERADOS"
+        if [ -n "$DEGRADADOS" ]; then
+            printf '\nDEGRADADO\n%s' "$DEGRADADOS"
+        fi
+        if [ -n "$SANOS" ]; then
+            printf '\nEN LÍNEA\n%s' "$SANOS"
+        fi
+        printf '\n'
+        if [ -n "$DESFASE" ]; then
+            printf 'Reloj: %+d s vs GitHub\n' "$DESFASE"
+            [ -n "$AVISO_RELOJ" ] && printf '%s\n' "$AVISO_RELOJ"
+        else
+            printf 'Reloj: no medido (sin red o sin `date` compatible)\n'
+        fi
+        printf 'Comprobado: %s\n' "$(date -u '+%Y-%m-%d %H:%M:%SZ')"
     fi
-    printf 'Comprobado: %s\n' "$(date -u '+%Y-%m-%d %H:%M:%SZ')"
 } > /tmp/vigilar.$$.informe
 INFORME="$(cat /tmp/vigilar.$$.informe)"
 rm -f /tmp/vigilar.$$.informe

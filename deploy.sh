@@ -645,6 +645,69 @@ EOF
         info "Vigía activo: timer gh-runner-vigilar.timer cada ${VIGILAR_CADA}."
         info "  Comprobar ahora : systemctl --user start gh-runner-vigilar.service"
         info "  Ver el informe  : ${_dir_deploy}/vigilar.sh --informe"
+    elif [ "$(uname -s 2>/dev/null || echo)" = "Darwin" ]; then
+        # macOS: launchd. Se instala de verdad, no se imprimen instrucciones —
+        # dejarlo a mano es la diferencia entre tener vigilancia y creer tenerla.
+        _seg="$(printf '%s' "$VIGILAR_CADA" | tr -cd '0-9')"
+        case "$VIGILAR_CADA" in
+            *h)   _seg=$(( ${_seg:-1} * 3600 )) ;;
+            *min) _seg=$(( ${_seg:-5} * 60 )) ;;
+            *s)   : ;;
+            *)    _seg=$(( ${_seg:-5} * 60 )) ;;
+        esac
+        [ "${_seg:-0}" -ge 60 ] 2>/dev/null || _seg=300
+
+        # PATH EXPLÍCITO, y es lo que hace que esto funcione. launchd arranca con
+        # un PATH mínimo (/usr/bin:/bin:/usr/sbin:/sbin) que NO incluye
+        # /opt/homebrew/bin ni /usr/local/bin, que es donde vive podman. Sin esta
+        # línea el vigía no encontraría el motor en cada ronda.
+        _bindir="$(dirname "$(command -v "$ENGINE")")"
+        _agents="$HOME/Library/LaunchAgents"
+        _plist="$_agents/com.gh-runner.vigilar.plist"
+        mkdir -p "$_agents"
+        cat > "$_plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gh-runner.vigilar</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>${_dir_deploy}/vigilar.sh</string>
+    <string>--hooks</string>
+    <string>${VIGILAR_HOOKS}</string>
+  </array>
+  <key>WorkingDirectory</key><string>${_dir_deploy}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>${_bindir}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartInterval</key><integer>${_seg}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>${_dir_deploy}/vigilar.log</string>
+  <key>StandardErrorPath</key><string>${_dir_deploy}/vigilar.log</string>
+</dict>
+</plist>
+EOF
+        # bootstrap es la forma moderna; load -w sigue funcionando en versiones
+        # antiguas. Se descarga antes por si ya había uno cargado.
+        launchctl bootout "gui/$(id -u)/com.gh-runner.vigilar" 2>/dev/null || true
+        launchctl unload "$_plist" 2>/dev/null || true
+        if launchctl bootstrap "gui/$(id -u)" "$_plist" 2>/dev/null \
+           || launchctl load -w "$_plist" 2>/dev/null; then
+            info "Vigía activo: agente launchd cada $(( _seg / 60 )) min."
+            info "  Comprobar ahora : launchctl kickstart gui/$(id -u)/com.gh-runner.vigilar"
+            info "  Registro        : ${_dir_deploy}/vigilar.log"
+            info "  Quitarlo        : launchctl bootout gui/$(id -u)/com.gh-runner.vigilar"
+        else
+            info "AVISO: escribí $_plist pero launchctl no lo cargó. Cárgalo con:"
+            info "  launchctl bootstrap gui/$(id -u) $_plist"
+        fi
+        info ""
+        info "OJO en macOS: podman corre en una VM y NO arranca sola al iniciar sesión."
+        info "  Si la máquina se apaga, el vigía te avisará de que el motor no responde."
+        info "  Para que arranque sola:  brew services start podman   (o podman machine start)"
     else
         # La cadencia en minutos para el ejemplo de cron/launchd (systemd acepta
         # "5min", cron no). Si no se puede deducir, se cae a 5.
