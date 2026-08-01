@@ -107,7 +107,7 @@ jobs:
           # Un hook que habla siempre (latido), otro solo si cambió (Telegram),
           # otro que revienta y otro que se cuelga: los dos últimos NO pueden
           # impedir que los primeros hablen.
-          printf '#!/bin/sh\n{ echo "LATIDO $VIGILAR_ESTADO $VIGILAR_CAMBIO"; cat; } >> %s/log\n' "$d" > "$d/hooks/10-latido"
+          printf '#!/bin/sh\n{ echo "LATIDO $VIGILAR_ESTADO $VIGILAR_CAMBIO primera=$VIGILAR_PRIMERA"; cat; } >> %s/log\n' "$d" > "$d/hooks/10-latido"
           printf '#!/bin/sh\n[ "$VIGILAR_CAMBIO" = si ] || exit 0\necho "TELEGRAM" >> %s/log\n' "$d" > "$d/hooks/20-tg"
           printf '#!/bin/sh\nexit 7\n' > "$d/hooks/30-roto"
           printf '#!/bin/sh\nsleep 300\n' > "$d/hooks/40-colgado"
@@ -130,9 +130,11 @@ jobs:
           grep -q 'NO-DEBE-CORRER' log && { echo "FALLO: corrió un hook sin permiso de ejecución"; exit 1; }
           [ "$(grep -c '^LATIDO' log)" = 2 ] || { echo "FALLO: el latido debe sonar en CADA ronda"; exit 1; }
           [ "$(grep -c '^TELEGRAM' log)" = 1 ] || { echo "FALLO: el aviso debe callar si nada cambió"; exit 1; }
-          grep -q 'LATIDO degradado si' log || { echo "FALLO: el estado no llega al hook"; exit 1; }
-          grep -q 'LATIDO degradado no' log || { echo "FALLO: el anti-spam no marca la 2ª ronda"; exit 1; }
-          echo "ok: informe, hooks aislados y anti-spam"
+          grep -q 'LATIDO degradado si primera=si' log || { echo "FALLO: el estado no llega al hook, o la 1ª ronda no se marca"; exit 1; }
+          # La 2ª ronda NO es la primera: sin esto, una recuperación y el arranque
+          # llegarían idénticos y el primer aviso diría "runners de vuelta".
+          grep -q 'LATIDO degradado no primera=no' log || { echo "FALLO: la 2ª ronda sigue marcada como primera"; exit 1; }
+          echo "ok: informe, hooks aislados, anti-spam y primera ronda"
 
   smoke:
     runs-on: ubuntu-latest

@@ -374,7 +374,9 @@ Comprobado: 2026-08-01 15:04:12Z
 `vigilar.sh` **no habla con ningún servicio**. Ejecuta todo lo que sea ejecutable en el directorio de hooks (convención *run-parts*, la de `cron.d` y los hooks de git), en orden alfabético, y les pasa:
 
 - el **informe completo** por **stdin**;
-- `VIGILAR_ESTADO` (`sano` / `degradado`), `VIGILAR_CAMBIO` (`si` / `no`, ¿cambió respecto a la ronda anterior?), `VIGILAR_CAIDOS`, `VIGILAR_HOST`, `VIGILAR_ONLINE`, `VIGILAR_ESPERADOS`.
+- `VIGILAR_ESTADO` (`sano` / `degradado`), `VIGILAR_CAMBIO` (`si` / `no`, ¿cambió respecto a la ronda anterior?), `VIGILAR_PRIMERA` (`si` en la primera ronda tras instalar), `VIGILAR_CAIDOS`, `VIGILAR_HOST`, `VIGILAR_ONLINE`, `VIGILAR_ESPERADOS`.
+
+`VIGILAR_PRIMERA` existe porque la primera ronda y una recuperación llegan **idénticas** —estado sano, cambio sí—, y sin distinguirlas el primer aviso tras instalar diría «runners de vuelta» sin que se hubiera ido nadie. Justo el mensaje que miras para comprobar que el montaje funciona.
 
 Los hooks corren en **cada** ronda; cada uno decide si le importa el cambio. Así el anti-spam vive en un solo sitio y los hooks son de tres líneas. Un hook que falle o se cuelgue **no impide** a los demás ni rompe el timer.
 

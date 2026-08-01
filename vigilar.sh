@@ -276,8 +276,10 @@ fi
 # que quiera hablar solo cuando algo cambia mira VIGILAR_CAMBIO; el latido lo
 # ignora a propósito, porque necesita mandarse siempre.
 CAMBIO="si"
+PRIMERA="si"
 if [ -f "$ESTADO_FILE" ]; then
     _previa="$(cat "$ESTADO_FILE" 2>/dev/null || true)"
+    [ -n "$_previa" ] && PRIMERA="no"
     [ "$_previa" = "$HUELLA" ] && CAMBIO="no"
 fi
 mkdir -p "$(dirname "$ESTADO_FILE")" 2>/dev/null || true
@@ -286,6 +288,11 @@ printf '%s' "$HUELLA" > "$ESTADO_FILE" 2>/dev/null || true
 # ---- Hooks -----------------------------------------------------------------
 export VIGILAR_ESTADO="$ESTADO"
 export VIGILAR_CAMBIO="$CAMBIO"
+# Distingue "es la primera ronda" de "se ha recuperado". Sin esto un hook no
+# puede saberlo —las dos llegan con estado sano y cambio si—, y el primer aviso
+# tras instalar diría "runners de vuelta" sin que se hubiera ido nadie. Es justo
+# el mensaje que se mira para comprobar que el montaje funciona.
+export VIGILAR_PRIMERA="$PRIMERA"
 export VIGILAR_CAIDOS="$CAIDOS"
 export VIGILAR_HOST="$HOSTNAME_CORTO"
 export VIGILAR_ONLINE="$ONLINE"

@@ -46,10 +46,14 @@ ESCAPADO="$(printf '%s' "$INFORME" \
 
 # <pre> = monospace: es lo que mantiene las columnas alineadas en el móvil. Con
 # texto normal, la fuente proporcional descuadra la tabla y se vuelve ilegible.
-if [ "${VIGILAR_ESTADO:-sano}" = "sano" ]; then
-    TITULO="✅ Runners de vuelta"
-else
+if [ "${VIGILAR_ESTADO:-sano}" != "sano" ]; then
     TITULO="🔴 Runners en problemas"
+elif [ "${VIGILAR_PRIMERA:-no}" = "si" ]; then
+    # Primera ronda: nada se había ido, así que "de vuelta" seria falso. Además
+    # este es el mensaje que confirma que el montaje funciona.
+    TITULO="🔎 Vigilancia activa"
+else
+    TITULO="✅ Runners de vuelta"
 fi
 
 # --data-urlencode evita el infierno de comillas y escapa por nosotros los
