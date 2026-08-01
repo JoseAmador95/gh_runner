@@ -391,6 +391,22 @@ cp 20-telegram.sh.ejemplo     20-telegram.sh     && chmod 700 20-telegram.sh
 $EDITOR 10-healthchecks.sh 20-telegram.sh        # pon la URL de ping y el token del bot
 ```
 
+**Para no editarlos en cada máquina**, los dos ejemplos leen antes un fichero opcional,
+`~/.config/gh-runner/avisos.conf` (ruta configurable con `VIGILAR_CONF`), y solo caen a su valor
+inline si no existe:
+
+```sh
+# ~/.config/gh-runner/avisos.conf   -- chmod 600: lleva credenciales
+HC_URL='https://hc-ping.com/tu-uuid'
+TG_TOKEN='123456:ABC-DEF'
+TG_CHAT='-1001234567890'
+TG_THREAD=''            # opcional
+```
+
+Con eso, aprovisionar otro host es copiar **un fichero** (`scp avisos.conf otro:~/.config/gh-runner/`)
+y los hooks quedan tal cual salen del ejemplo. El fichero se **ejecuta** (`.`) desde el hook, así que
+va con `chmod 600` y solo debe escribirlo su dueño — el mismo nivel de confianza que el propio hook.
+
 Los dos ejemplos hacen cosas **distintas y complementarias**:
 
 - **`10-healthchecks.sh` — el latido, el aviso por ausencia y el historial.** Es el único que cubre el fallo que la máquina no puede contar por sí misma: **que esté apagada o sin internet**. Nadie manda un aviso desde un host muerto. La vuelta es un **latido invertido**: mientras todo va bien la máquina hace ping cada ronda, y es el **servicio** quien avisa cuando el ping **deja de llegar**. Por eso ignora `VIGILAR_CAMBIO` a propósito: tiene que mandarse siempre. Va con prefijo `10-` para que un hook roto más abajo nunca retrase la señal de vida.

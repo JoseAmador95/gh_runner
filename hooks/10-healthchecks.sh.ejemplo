@@ -35,8 +35,15 @@
 # ============================================================================
 set -u
 
-# vvv EDITA ESTO vvv  (Checks -> tu check -> "Ping URL")
-URL="https://hc-ping.com/00000000-0000-0000-0000-000000000000"
+# Fichero de configuración opcional, para NO editar este script en cada máquina:
+# si existe, de ahí sale HC_URL. Es lo que permite aprovisionar un host entero
+# con un solo fichero (chmod 600) en vez de a mano, hook por hook.
+CONF="${VIGILAR_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/gh-runner/avisos.conf}"
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+# vvv O EDITA ESTO vvv  (Checks -> tu check -> "Ping URL")
+URL="${HC_URL:-https://hc-ping.com/00000000-0000-0000-0000-000000000000}"
 
 # El informe llega por stdin. Se lee una sola vez.
 INFORME="$(cat)"

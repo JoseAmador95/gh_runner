@@ -43,6 +43,36 @@ jobs:
       - name: shellcheck de los hooks de ejemplo
         run: shellcheck --severity=warning --shell=sh hooks/*.ejemplo
 
+      # Es lo que permite aprovisionar un host copiando UN fichero en vez de
+      # editar cada hook a mano. Si se rompiera, los hooks volverían al valor de
+      # ejemplo y mandarían los avisos a la nada — en silencio.
+      - name: Los hooks leen su configuración de un fichero aparte
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/conf"; rm -rf "$d"; mkdir -p "$d"
+          cp hooks/10-healthchecks.sh.ejemplo "$d/10.sh"
+          cp hooks/20-telegram.sh.ejemplo     "$d/20.sh"
+          chmod +x "$d"/*.sh
+          cat > "$d/avisos.conf" <<'CONF'
+          HC_URL='https://hc-ping.com/UUID-DEL-FICHERO'
+          TG_TOKEN='777:TOKEN-DEL-FICHERO'
+          TG_CHAT='-100777'
+          CONF
+          # curl falso: registra a dónde habría ido cada petición.
+          mkdir -p "$d/bin"
+          printf '#!/bin/sh\nfor a in "$@"; do case "$a" in https://*) echo "$a" >> %s/red.log ;; esac; done\n' "$d" > "$d/bin/curl"
+          chmod +x "$d/bin/curl"
+
+          cd "$d"
+          PATH="$d/bin:$PATH" VIGILAR_CONF="$d/avisos.conf" \
+            VIGILAR_ESTADO=degradado VIGILAR_CAMBIO=si VIGILAR_HOST=ci \
+            sh -c 'printf "informe\n" | ./10.sh; printf "informe\n" | ./20.sh'
+
+          grep -q 'UUID-DEL-FICHERO'  red.log || { echo "FALLO: healthchecks ignoró el fichero"; exit 1; }
+          grep -q 'TOKEN-DEL-FICHERO' red.log || { echo "FALLO: telegram ignoró el fichero"; exit 1; }
+          grep -q '00000000-0000'     red.log && { echo "FALLO: usó el valor de ejemplo"; exit 1; }
+          echo "ok: los hooks toman sus valores del fichero de configuración"
+
       - name: healthcheck.sh distingue atascado de sano
         run: |
           set -eu

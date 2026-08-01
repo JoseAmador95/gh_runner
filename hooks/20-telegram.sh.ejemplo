@@ -29,10 +29,17 @@
 # ============================================================================
 set -u
 
-# vvv EDITA ESTO vvv
-TOKEN="123456789:AA-reemplaza-esto-por-el-token-de-tu-bot"
-CHAT="-1001234567890"
-THREAD=""       # opcional: id del tema dentro del grupo
+# Fichero de configuración opcional, para NO editar este script en cada máquina:
+# si existe, de ahí salen TG_TOKEN / TG_CHAT / TG_THREAD. Es lo que permite
+# aprovisionar un host con un solo fichero (chmod 600) en vez de a mano.
+CONF="${VIGILAR_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/gh-runner/avisos.conf}"
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+# vvv O EDITA ESTO vvv
+TOKEN="${TG_TOKEN:-123456789:AA-reemplaza-esto-por-el-token-de-tu-bot}"
+CHAT="${TG_CHAT:--1001234567890}"
+THREAD="${TG_THREAD:-}"       # opcional: id del tema dentro del grupo
 
 # Solo hablamos cuando el estado del fleet cambió respecto a la ronda anterior.
 [ "${VIGILAR_CAMBIO:-si}" = "si" ] || exit 0
