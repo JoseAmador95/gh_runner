@@ -29,6 +29,143 @@ jobs:
           dockerfile: Containerfile
           failure-threshold: error
 
+  # El vigía no tiene forma de fallar en rojo por sí solo (avisa, no rompe), así
+  # que su regresión sería SILENCIOSA: creerías tener vigilancia sin tenerla.
+  # Esto fija su comportamiento con casos reales, empezando por el fallo que lo
+  # motivó (runner "Up" pero atascado en "Retrying until reconnected").
+  vigia:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Los hooks acaban en .ejemplo, así que la acción de shellcheck no los
+      # detecta por extensión; se analizan aquí explícitamente.
+      - name: shellcheck de los hooks de ejemplo
+        run: shellcheck --severity=warning --shell=sh hooks/*.ejemplo
+
+      # Es lo que permite aprovisionar un host copiando UN fichero en vez de
+      # editar cada hook a mano. Si se rompiera, los hooks volverían al valor de
+      # ejemplo y mandarían los avisos a la nada — en silencio.
+      - name: Los hooks leen su configuración de un fichero aparte
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/conf"; rm -rf "$d"; mkdir -p "$d"
+          cp hooks/10-healthchecks.sh.ejemplo "$d/10.sh"
+          cp hooks/20-telegram.sh.ejemplo     "$d/20.sh"
+          chmod +x "$d"/*.sh
+          cat > "$d/avisos.conf" <<'CONF'
+          HC_URL='https://hc-ping.com/UUID-DEL-FICHERO'
+          TG_TOKEN='777:TOKEN-DEL-FICHERO'
+          TG_CHAT='-100777'
+          CONF
+          # curl falso: registra a dónde habría ido cada petición.
+          mkdir -p "$d/bin"
+          printf '#!/bin/sh\nfor a in "$@"; do case "$a" in https://*) echo "$a" >> %s/red.log ;; esac; done\n' "$d" > "$d/bin/curl"
+          chmod +x "$d/bin/curl"
+
+          cd "$d"
+          PATH="$d/bin:$PATH" VIGILAR_CONF="$d/avisos.conf" \
+            VIGILAR_ESTADO=degradado VIGILAR_CAMBIO=si VIGILAR_HOST=ci \
+            sh -c 'printf "informe\n" | ./10.sh; printf "informe\n" | ./20.sh'
+
+          grep -q 'UUID-DEL-FICHERO'  red.log || { echo "FALLO: healthchecks ignoró el fichero"; exit 1; }
+          grep -q 'TOKEN-DEL-FICHERO' red.log || { echo "FALLO: telegram ignoró el fichero"; exit 1; }
+          grep -q '00000000-0000'     red.log && { echo "FALLO: usó el valor de ejemplo"; exit 1; }
+          echo "ok: los hooks toman sus valores del fichero de configuración"
+
+      - name: healthcheck.sh distingue atascado de sano
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/hc"; rm -rf "$d"; mkdir -p "$d/_diag"
+          export RUNNER_DIAG_DIR="$d/_diag"
+          ahora="$(date -u '+%Y-%m-%d %H:%M:%S')"
+          viejo="$(date -u -d '-30 minutes' '+%Y-%m-%d %H:%M:%S')"
+          probar() {  # $1 = esperado, $2 = descripción
+            rc=0; ./healthcheck.sh >/dev/null 2>&1 || rc=$?
+            [ "$rc" = "$1" ] || { echo "FALLO ($2): rc=$rc, esperaba $1"; exit 1; }
+            echo "ok: $2"
+          }
+          probar 0 'sin log todavía (arranque) => sano'
+
+          printf '[%sZ INFO Listener] Listening for Jobs\n' "$ahora" > "$d/_diag/Runner_x.log"
+          probar 0 'escuchando => sano'
+
+          printf '[%sZ INFO Listener] Running job: unit\n' "$ahora" > "$d/_diag/Runner_x.log"
+          probar 0 'ejecutando un job => sano (no exige estar escuchando)'
+
+          # El fallo del 1-ago-2026, reproducido tal cual salió en el log.
+          printf '[%sZ ERR  Listener] Runner connect error: The token expired on 11:21:01. Current server time is 11:48:06. Retrying until reconnected.\n' "$ahora" >> "$d/_diag/Runner_x.log"
+          probar 1 'atascado reconectando => unhealthy'
+
+          printf '[%sZ ERR  Listener] Retrying until reconnected.\n[%sZ INFO Listener] Listening for Jobs\n' "$viejo" "$ahora" > "$d/_diag/Runner_x.log"
+          probar 0 'error ya superado (fuera de ventana) => sano'
+
+          printf '[%sZ ERR  Worker] Runner connect error: falla el JOB\n' "$ahora" > "$d/_diag/Worker_y.log"
+          printf '[%sZ INFO Listener] Listening for Jobs\n' "$ahora" > "$d/_diag/Runner_x.log"
+          probar 0 'un job que falla NO es un runner enfermo'
+
+      - name: vigilar.sh informa, dispara los hooks y no se repite
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/vg"; rm -rf "$d"; mkdir -p "$d/bin" "$d/hooks"
+          sh ./deploy.sh --no-up --skip-validation --token FAKE --repo o/r --count 3 >/dev/null 2>&1
+          cp compose.yaml "$d/compose.yaml"
+
+          # runner-1 sano, runner-2 atascado, runner-3 sin contenedor.
+          cat > "$d/bin/podman" <<'STUB'
+          #!/bin/sh
+          if [ "$1 $2" = "ps -a" ]; then
+            for a in "$@"; do case "$a" in
+              *".service=runner-1") echo "p_runner-1_1"; exit 0 ;;
+              *".service=runner-2") echo "p_runner-2_1"; exit 0 ;;
+              *".service=runner-3") exit 0 ;;
+            esac; done
+            exit 0
+          fi
+          if [ "$1" = "inspect" ]; then
+            case "$3" in *State.Health.Log*) echo "atascado reconectando con GitHub"; exit 0 ;; esac
+            case "$4" in
+              *runner-1*) echo "running|healthy" ;;
+              *runner-2*) echo "running|unhealthy" ;;
+            esac
+            exit 0
+          fi
+          exit 0
+          STUB
+          chmod +x "$d/bin/podman"
+
+          # Un hook que habla siempre (latido), otro solo si cambió (Telegram),
+          # otro que revienta y otro que se cuelga: los dos últimos NO pueden
+          # impedir que los primeros hablen.
+          printf '#!/bin/sh\n{ echo "LATIDO $VIGILAR_ESTADO $VIGILAR_CAMBIO primera=$VIGILAR_PRIMERA"; cat; } >> %s/log\n' "$d" > "$d/hooks/10-latido"
+          printf '#!/bin/sh\n[ "$VIGILAR_CAMBIO" = si ] || exit 0\necho "TELEGRAM" >> %s/log\n' "$d" > "$d/hooks/20-tg"
+          printf '#!/bin/sh\nexit 7\n' > "$d/hooks/30-roto"
+          printf '#!/bin/sh\nsleep 300\n' > "$d/hooks/40-colgado"
+          printf '#!/bin/sh\necho NO-DEBE-CORRER >> %s/log\n' "$d" > "$d/hooks/50-sin-permiso"
+          chmod +x "$d/hooks/10-latido" "$d/hooks/20-tg" "$d/hooks/30-roto" "$d/hooks/40-colgado"
+
+          export PATH="$d/bin:$PATH"
+          cd "$d"
+
+          informe="$(sh "$GITHUB_WORKSPACE/vigilar.sh" --informe)"
+          echo "$informe"
+          echo "$informe" | grep -q 'atascado' || { echo "FALLO: el atascado no sale en el informe"; exit 1; }
+          echo "$informe" | grep -q 'ausente'  || { echo "FALLO: el ausente no sale en el informe"; exit 1; }
+          echo "$informe" | grep -q '1/3'      || { echo "FALLO: el recuento no cuadra"; exit 1; }
+
+          V="sh $GITHUB_WORKSPACE/vigilar.sh --hooks $d/hooks --estado $d/estado"
+          $V >/dev/null 2>&1
+          $V >/dev/null 2>&1   # segunda ronda: nada cambió
+
+          grep -q 'NO-DEBE-CORRER' log && { echo "FALLO: corrió un hook sin permiso de ejecución"; exit 1; }
+          [ "$(grep -c '^LATIDO' log)" = 2 ] || { echo "FALLO: el latido debe sonar en CADA ronda"; exit 1; }
+          [ "$(grep -c '^TELEGRAM' log)" = 1 ] || { echo "FALLO: el aviso debe callar si nada cambió"; exit 1; }
+          grep -q 'LATIDO degradado si primera=si' log || { echo "FALLO: el estado no llega al hook, o la 1ª ronda no se marca"; exit 1; }
+          # La 2ª ronda NO es la primera: sin esto, una recuperación y el arranque
+          # llegarían idénticos y el primer aviso diría "runners de vuelta".
+          grep -q 'LATIDO degradado no primera=no' log || { echo "FALLO: la 2ª ronda sigue marcada como primera"; exit 1; }
+          echo "ok: informe, hooks aislados, anti-spam y primera ronda"
+
   smoke:
     runs-on: ubuntu-latest
     steps:
@@ -66,3 +203,43 @@ jobs:
           assert doc["secrets"]["access_token"]["file"] == "./access_token"
           print("compose.yaml OK:", list(svcs))
           PY
+
+      # La vigilancia vive en el HOST y en la imagen, nunca en el compose: ni un
+      # servicio extra, ni un volumen, ni el socket de podman montado. Esto lo
+      # fija, porque es lo que hace que activarla no pueda romper un despliegue
+      # existente ni dependa de que el proveedor de compose soporte tal bloque.
+      - name: El vigía NO toca el compose
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/cmp"
+          cp compose.yaml "$RUNNER_TEMP/cmp/base.yaml"
+          for extra in "--no-host-label" "--vigilar-cada 2min"; do
+            rm -f compose.yaml .env access_token
+            # shellcheck disable=SC2086
+            sh ./deploy.sh --no-up --skip-validation \
+              --token FAKE --repo owner/repo --count 2 --cpus 2 --memory 2g --secret $extra >/dev/null 2>&1
+            diff -u "$RUNNER_TEMP/cmp/base.yaml" compose.yaml \
+              || { echo "FALLO: '$extra' cambió el compose"; exit 1; }
+          done
+          echo "ok: el compose es idéntico con y sin las opciones del vigía"
+
+      # La etiqueta de host va en su PROPIA variable. Si se colara dentro de
+      # RUNNER_LABELS, borraría el default del entrypoint en los despliegues sin
+      # --labels y un `runs-on: [self-hosted, ubuntu-24.04]` dejaría de casar.
+      - name: La etiqueta de host es aditiva
+        run: |
+          set -eu
+          rm -f compose.yaml .env access_token
+          sh ./deploy.sh --no-up --skip-validation --token FAKE --repo o/r >/dev/null 2>&1
+          grep -q '^RUNNER_HOST_LABEL=host:' .env || { echo "FALLO: falta la etiqueta de host"; exit 1; }
+          grep -q '^RUNNER_LABELS='          .env && { echo "FALLO: la etiqueta se coló en RUNNER_LABELS"; exit 1; }
+
+          rm -f compose.yaml .env
+          sh ./deploy.sh --no-up --skip-validation --token FAKE --repo o/r --labels sherman >/dev/null 2>&1
+          grep -qx 'RUNNER_LABELS=sherman' .env || { echo "FALLO: --labels no llegó intacta"; exit 1; }
+          grep -q  '^RUNNER_HOST_LABEL=host:' .env || { echo "FALLO: falta la etiqueta de host"; exit 1; }
+
+          rm -f compose.yaml .env
+          sh ./deploy.sh --no-up --skip-validation --token FAKE --repo o/r --no-host-label >/dev/null 2>&1
+          grep -q '^RUNNER_HOST_LABEL=' .env && { echo "FALLO: --no-host-label no la quitó"; exit 1; }
+          echo "ok: etiqueta de host aditiva y desactivable"

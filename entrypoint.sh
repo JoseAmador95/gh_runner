@@ -31,6 +31,11 @@ REPO_URL="https://github.com/${REPO_USER}/${REPO_NAME}"
 # Solo cuando no se proporciona se genera un default único por host + repo.
 RUNNER_NAME="${RUNNER_NAME:-$(hostname)-${REPO_USER}-${REPO_NAME}}"
 RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,ubuntu-24.04}"
+# Etiqueta de host (host:mi-maquina), que deploy.sh pasa APARTE a propósito: si
+# viniera dentro de RUNNER_LABELS borraría el default de arriba en los despliegues
+# que no pasan --labels, y un `runs-on` que casaba dejaría de casar. Aquí se suma
+# a lo que haya, así que solo puede añadir.
+[ -n "${RUNNER_HOST_LABEL:-}" ] && RUNNER_LABELS="${RUNNER_LABELS},${RUNNER_HOST_LABEL}"
 RUNNER_GROUP="${RUNNER_GROUP:-}"
 # Auto-update del runner DESACTIVADO por defecto: un self-update a mitad de job
 # cancela el job y, al ser efímero, deja config local huérfana → crash-loop (ver

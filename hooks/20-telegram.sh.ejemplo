@@ -1,0 +1,77 @@
+#!/bin/sh
+# ============================================================================
+# Hook de vigilar.sh — EL MENSAJE LEGIBLE (Telegram, envío directo)
+#
+# Para usarlo:
+#   1. cp 20-telegram.sh.ejemplo ~/.config/gh-runner/hooks.d/20-telegram.sh
+#   2. Rellena token y chat abajo.
+#   3. chmod 700 el fichero  <-- contiene el token del bot: que no lo lea nadie más.
+#
+# QUÉ APORTA: el informe completo, tal cual, en el móvil. Va directo al API de
+# Telegram y NO depende de que healthchecks.io reenvíe el cuerpo del ping. Esa
+# es toda la gracia de tenerlo aparte: el mensaje que de verdad quieres leer no
+# queda a merced de cómo formatee un tercero.
+#
+# Si además configuras la integración de Telegram en healthchecks.io, tendrás el
+# aviso por partida doble y podrás quitar uno de los dos. Empieza con los dos.
+#
+# HABLA SOLO CUANDO ALGO CAMBIA. El anti-spam vive en vigilar.sh, que ya calcula
+# VIGILAR_CAMBIO comparando con la ronda anterior; aquí basta una línea. Sin eso
+# llegaría un mensaje cada 5 minutos para siempre.
+#
+# CÓMO OBTENER LOS DATOS:
+#   TOKEN  -> habla con @BotFather, /newbot, te da 123456:ABC-DEF...
+#   CHAT   -> añade el bot al grupo/canal, manda un mensaje y abre
+#             https://api.telegram.org/bot<TOKEN>/getUpdates  -> "chat":{"id":-100...}
+#             (En un grupo, dale al bot permiso de publicar.)
+#   THREAD -> solo en grupos con Temas activados: el "message_thread_id" del
+#             mismo getUpdates. Déjalo vacío si no usas temas.
+# ============================================================================
+set -u
+
+# Fichero de configuración opcional, para NO editar este script en cada máquina:
+# si existe, de ahí salen TG_TOKEN / TG_CHAT / TG_THREAD. Es lo que permite
+# aprovisionar un host con un solo fichero (chmod 600) en vez de a mano.
+CONF="${VIGILAR_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/gh-runner/avisos.conf}"
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+# vvv O EDITA ESTO vvv
+TOKEN="${TG_TOKEN:-123456789:AA-reemplaza-esto-por-el-token-de-tu-bot}"
+CHAT="${TG_CHAT:--1001234567890}"
+THREAD="${TG_THREAD:-}"       # opcional: id del tema dentro del grupo
+
+# Solo hablamos cuando el estado del fleet cambió respecto a la ronda anterior.
+[ "${VIGILAR_CAMBIO:-si}" = "si" ] || exit 0
+
+INFORME="$(cat)"
+
+# Escapado de HTML para Telegram. El orden importa: el & va PRIMERO o
+# reescribiría los & que acaban de introducir las otras dos sustituciones.
+ESCAPADO="$(printf '%s' "$INFORME" \
+    | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+
+# <pre> = monospace: es lo que mantiene las columnas alineadas en el móvil. Con
+# texto normal, la fuente proporcional descuadra la tabla y se vuelve ilegible.
+if [ "${VIGILAR_ESTADO:-sano}" != "sano" ]; then
+    TITULO="🔴 Runners en problemas"
+elif [ "${VIGILAR_PRIMERA:-no}" = "si" ]; then
+    # Primera ronda: nada se había ido, así que "de vuelta" seria falso. Además
+    # este es el mensaje que confirma que el montaje funciona.
+    TITULO="🔎 Vigilancia activa"
+else
+    TITULO="✅ Runners de vuelta"
+fi
+
+# --data-urlencode evita el infierno de comillas y escapa por nosotros los
+# saltos de línea del informe.
+set -- \
+    --data-urlencode "chat_id=${CHAT}" \
+    --data-urlencode "parse_mode=HTML" \
+    --data-urlencode "text=<b>${TITULO}</b> — ${VIGILAR_HOST:-host}
+<pre>${ESCAPADO}</pre>"
+[ -n "$THREAD" ] && set -- "$@" --data-urlencode "message_thread_id=${THREAD}"
+
+curl -fsS -m 15 --retry 2 --retry-delay 2 \
+     -X POST "$@" \
+     "https://api.telegram.org/bot${TOKEN}/sendMessage" >/dev/null

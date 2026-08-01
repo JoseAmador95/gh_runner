@@ -12,3 +12,8 @@ compose.yml
 # Datos locales del runner / logs.
 _work/
 *.log
+
+# Hooks del vigía: cada uno guarda su credencial (token de bot, URL de ping).
+# Normalmente viven en ~/.config/gh-runner/hooks.d, pero si alguien los pone en
+# el directorio del despliegue, que no acaben en un commit.
+hooks.d/

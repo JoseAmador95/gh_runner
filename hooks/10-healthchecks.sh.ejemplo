@@ -1,0 +1,71 @@
+#!/bin/sh
+# ============================================================================
+# Hook de vigilar.sh — LATIDO, AVISO POR AUSENCIA E HISTORIAL (healthchecks.io)
+#
+# Para usarlo:
+#   1. cp 10-healthchecks.sh.ejemplo ~/.config/gh-runner/hooks.d/10-healthchecks.sh
+#   2. Pon tu URL de ping abajo.
+#   3. chmod 700 el fichero  <-- contiene una credencial: que no lo lea nadie más.
+#
+# QUÉ APORTA, Y POR QUÉ ES EL PRIMERO DE LA FILA:
+# Este es el único que cubre el fallo que la máquina NO puede contar por sí
+# misma: que esté apagada o sin internet. Nadie manda un aviso desde un host
+# muerto. La vuelta es un LATIDO INVERTIDO: mientras todo va bien la máquina
+# hace ping cada ronda, y es el SERVICIO quien avisa cuando el ping deja de
+# llegar. Es el "last will" que Telegram no tiene.
+#
+# Por eso IGNORA a propósito VIGILAR_CAMBIO: tiene que mandarse SIEMPRE, cambie
+# algo o no. Si solo hablara cuando algo cambia, el servicio interpretaría un
+# fleet sano y estable como una máquina muerta, y avisaría cada pocos minutos.
+#
+# El prefijo 10- lo pone el primero de la fila (orden lexicográfico) para que un
+# hook roto más abajo nunca retrase la señal de vida.
+#
+# El anti-spam de las notificaciones sale gratis: healthchecks.io avisa al caer
+# y al recuperarse, y calla mientras no cambie. El enrutado (Telegram, correo,
+# Slack…) se configura en su web, sin tocar este fichero.
+#
+# NOTA: el informe va como cuerpo del ping, así que el panel guarda el HISTORIAL
+# completo de cada ronda. Que además lo reenvíe al móvil depende de la
+# integración que configures; el mensaje legible NO depende de eso, lo manda
+# 20-telegram.sh por su cuenta.
+#
+# Es software libre y self-hostable, así que la dependencia es reversible:
+# cambia la URL por la de tu instancia y este hook sigue igual.
+# ============================================================================
+set -u
+
+# Fichero de configuración opcional, para NO editar este script en cada máquina:
+# si existe, de ahí sale HC_URL. Es lo que permite aprovisionar un host entero
+# con un solo fichero (chmod 600) en vez de a mano, hook por hook.
+CONF="${VIGILAR_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/gh-runner/avisos.conf}"
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+# vvv O EDITA ESTO vvv  (Checks -> tu check -> "Ping URL")
+URL="${HC_URL:-https://hc-ping.com/00000000-0000-0000-0000-000000000000}"
+
+# El informe llega por stdin. Se lee una sola vez.
+INFORME="$(cat)"
+
+# Ruta /fail cuando algo va mal: es lo que enciende el aviso en el panel. Sin
+# sufijo = "sigo viva y todo bien", que además es lo que resetea la cuenta atrás
+# del aviso por ausencia.
+if [ "${VIGILAR_ESTADO:-sano}" = "sano" ]; then
+    DESTINO="$URL"
+else
+    DESTINO="$URL/fail"
+fi
+
+# --data-raw @- manda el informe VERBATIM: sin @- curl trataría un texto que
+# empiece por @ como un nombre de fichero, y --data (sin -raw) le quita los
+# saltos de línea, que es justo lo que hace legible la tabla.
+# Reintentos porque una ronda perdida por un blip de red no debe leerse como
+# "la máquina murió"; -m acota para no comerse el timeout del hook.
+curl -fsS -m 10 --retry 2 --retry-delay 2 \
+     -X POST \
+     -H 'Content-Type: text/plain; charset=utf-8' \
+     --data-raw @- \
+     "$DESTINO" <<INFORME_EOF >/dev/null
+$INFORME
+INFORME_EOF
