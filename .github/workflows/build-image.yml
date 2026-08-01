@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Necesario para construir arm64 sobre un runner amd64 (emulación).
       - name: Set up QEMU
