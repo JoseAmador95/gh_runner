@@ -683,7 +683,13 @@ if [ "$VIGILAR" = "yes" ]; then
     mkdir -p "${_vigia_dir}/hooks.d"
     chmod 700 "$_vigia_dir" "${_vigia_dir}/hooks.d" 2>/dev/null || true
 
-    for _h in 10-healthchecks.sh 20-telegram.sh; do
+    # Solo el de healthchecks.io. Es el único que cubre el fallo que la máquina
+    # no puede contar por sí misma (que esté apagada), y además REENVÍA el informe
+    # entero a Telegram/correo/lo que configures en su web, en <pre>. Un segundo
+    # hook mandando lo mismo al mismo chat era un duplicado con un secreto extra
+    # que mantener en cada máquina. El ejemplo de Telegram sigue en el repo para
+    # quien quiera un canal independiente del proveedor.
+    for _h in 10-healthchecks.sh; do
         if [ ! -e "${_vigia_dir}/hooks.d/${_h}" ] && [ ! -e "${_vigia_dir}/hooks.d/${_h}.ejemplo" ]; then
             traer_del_repo "hooks/${_h}.ejemplo" "${_vigia_dir}/hooks.d/${_h}.ejemplo"
         fi
