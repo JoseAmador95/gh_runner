@@ -354,6 +354,37 @@ jobs:
               VIGILAR_ESTADO=sano VIGILAR_CLUSTER="$1" VIGILAR_HOST="$2" sh "$d/hc.sh" 2>/dev/null
             grep -v '/api/v3/' "$d/red" | head -1
           }
+          # Un check autocreado sin API key se queda con el periodo por defecto de
+          # healthchecks.io (1 día): sale verde y NO vigila. Pasó de verdad, con una
+          # de las dos máquinas del fleet. `configurar-avisos.sh` ya lo advierte al
+          # dar de alta, pero eso ocurre una vez y se va con el scroll; esto lo
+          # repite en cada latido, en el cuerpo que el panel enseña.
+          cuerpo() {  # $1 = conf extra -> lo que el hook manda como cuerpo del ping
+            : > "$d/cuerpo"
+            { printf "HC_PING_KEY='PK'\n"; printf '%s\n' "$1"; } > "$d/conf"
+            printf 'informe\n' | PATH="$d/bin2:$PATH" env VIGILAR_CONF="$d/conf" \
+              VIGILAR_ESTADO=sano VIGILAR_CLUSTER=sherman VIGILAR_HOST=ci sh "$d/hc.sh" 2>/dev/null
+            cat "$d/cuerpo"
+          }
+          # curl falso que además guarda stdin: el cuerpo viaja por --data-binary @-,
+          # así que el de arriba (solo URLs) no lo vería.
+          mkdir -p "$d/bin2"
+          printf '#!/bin/sh\ncase "$*" in *api/v3*) exit 0 ;; esac\ncat >> %s/cuerpo\n' "$d" > "$d/bin2/curl"
+          chmod +x "$d/bin2/curl"
+
+          cuerpo '' | grep -q 'NO está configurado' \
+            || { echo "FALLO: sin API key, el cuerpo no avisa de que el check está sin configurar"; cuerpo ''; exit 1; }
+          cuerpo '' | grep -q 'informe' \
+            || { echo "FALLO: el aviso se comió el informe"; exit 1; }
+          # Con la clave puesta el aviso desaparece: si no, sería permanente y se
+          # acabaría ignorando, que es como se pierde una alarma.
+          cuerpo "HC_API_KEY='AK'" | grep -q 'NO está configurado' \
+            && { echo "FALLO: con API key el aviso debería desaparecer"; exit 1; }
+          # Con HC_URL el check lo eligió una persona: su periodo no es cosa nuestra.
+          cuerpo "HC_URL='https://hc-ping.com/UUID'" | grep -q 'NO está configurado' \
+            && { echo "FALLO: con HC_URL no hay auto-provisión, no debe avisar"; exit 1; }
+          echo "ok: el hook avisa de su propio check sin configurar, y solo cuando toca"
+
           a="$(slug runners mmJA)"; b="$(slug runners otroMac)"; c="$(slug otro mmJA)"
           [ "$a" != "$b" ] || { echo "FALLO: el MISMO cluster en dos hosts comparte check: $a"; exit 1; }
           [ "$a" != "$c" ] || { echo "FALLO: dos clusters de un host comparten check: $a"; exit 1; }

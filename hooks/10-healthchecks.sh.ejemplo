@@ -132,6 +132,41 @@ if [ -n "${HC_API_KEY:-}" ] && [ -n "${VIGILAR_CLUSTER:-}" ]; then
       || echo "10-healthchecks: no pude configurar el check (sigo con el ping)" >&2
 fi
 
+# ---- Aviso: este check quedó SIN CONFIGURAR --------------------------------
+# Sin API key, `?create=1` deja el check con el periodo por defecto de
+# healthchecks.io —1 día, margen 1 hora—, así que esta máquina tardaría hasta 25
+# horas en avisar de que murió. Sale verde en el panel y parece vigilada: el
+# fallo exacto que este proyecto existe para cerrar.
+#
+# `configurar-avisos.sh` YA avisa de esto al dar de alta la máquina, y aun así
+# pasó: ese aviso ocurre una sola vez, en una terminal que se va con el scroll, y
+# después el vigía corre meses sin volver a mencionarlo. Caso real: de las dos
+# máquinas del fleet, una quedó con 10/5 y la otra con 1 día.
+#
+# El aviso viaja EN EL CUERPO DEL PING, que es lo que el panel enseña en el
+# último evento del check: aparece donde vive el problema y donde se mira al
+# sospechar. A stderr sale solo en las rondas que ya son noticiables, porque una
+# línea por ronda son ~288 al día y eso enseña a ignorar `podman compose logs`.
+#
+# La condición es «no hay API key», no «la llamada falló»: con la clave puesta,
+# un fallo de red puntual no significa que el check esté mal configurado —lo
+# configuró una ronda anterior— y meter el aviso ahí sería una falsa alarma. Ese
+# caso ya tiene su propia línea a stderr, arriba.
+#
+# Con HC_URL no se avisa: ahí el check lo eligió una persona, que ya decidió su
+# periodo. Y se apaga solo en cuanto alguien pone HC_API_KEY.
+if [ -n "$CREAR" ] && [ -z "${HC_API_KEY:-}" ]; then
+    INFORME="⚠ Este check NO está configurado: nació con periodo de 1 día y margen de 1 hora,
+  así que si esta máquina muriera, el aviso tardaría hasta 25 horas en llegar.
+  Arréglalo: pon HC_API_KEY en vigia/avisos.conf y reinicia el vigía, o ajusta a
+  mano en el panel Period = 10 minutes y Grace Time = 5 minutes.
+
+$INFORME"
+    if [ "${VIGILAR_CAMBIO:-}" = "si" ] || [ "${VIGILAR_PRIMERA:-}" = "si" ]; then
+        echo "10-healthchecks: sin HC_API_KEY, el check '${SLUG}' sigue con periodo de 1 día" >&2
+    fi
+fi
+
 # ---- El ping ---------------------------------------------------------------
 case "${VIGILAR_ESTADO:-sano}" in
     sano)    SUFIJO="" ;;
