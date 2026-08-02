@@ -100,8 +100,14 @@ done
 [ -n "$RUNNERS" ] || err "no sé a qué runners vigilar.
        Pasa --runners 'nombre-1 nombre-2' o define VIGIA_RUNNERS (lo hace deploy.sh)."
 
-HOSTNAME_CORTO="$(hostname 2>/dev/null || echo host)"
-HOSTNAME_CORTO="${HOSTNAME_CORTO%%.*}"
+# El host llega por entorno desde deploy.sh, que sí corre en el host. Dentro de
+# un contenedor `hostname` devuelve su ID —cambia en cada recreate—, así que solo
+# vale como último recurso (ejecución suelta fuera del compose).
+HOSTNAME_CORTO="${VIGIA_HOST:-}"
+if [ -z "$HOSTNAME_CORTO" ]; then
+    HOSTNAME_CORTO="$(hostname 2>/dev/null || echo host)"
+    HOSTNAME_CORTO="${HOSTNAME_CORTO%%.*}"
+fi
 [ -n "$CLUSTER" ] || CLUSTER="$HOSTNAME_CORTO"
 
 # El mismo saneado que aplica latido.sh al componer el nombre del fichero: si no
