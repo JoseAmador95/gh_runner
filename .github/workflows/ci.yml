@@ -391,6 +391,70 @@ jobs:
           print("ok: upsert idempotente, periodo corregido y methods=POST")
           PY
 
+
+      # El nombre del fleet es UNO. Iban por caminos separados: `--prefix sherman`
+      # renombraba los runners pero el check seguia llamandose como el directorio,
+      # asi que no habia forma de arreglar uno sin desalinear el otro. Y el host se
+      # anade solo a los dos, asi que meterlo en el nombre lo repite.
+      - name: Un solo nombre para runners y check, y el host no se repite
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/nom"; rm -rf "$d"
+          # Mismo saneado que deploy.sh, y SIN `cut`: cut anade su propio salto de
+          # linea y `tr -c` lo convertiria en '-', dejando el nombre esperado con
+          # un guion de mas.
+          host="$(hostname 2>/dev/null || echo runner)"
+          host="${host%%.*}"
+          host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9_-' '-')"
+
+          nombres() {  # $1 = directorio, $2… = flags
+            mkdir -p "$d/$1"; ( cd "$d/$1"; rm -f compose.yaml .env
+              shift
+              # shellcheck disable=SC2086
+              sh "$GITHUB_WORKSPACE/deploy.sh" --no-up --skip-validation --token F \
+                 --repo o/r --count 1 --vigilar $* > "$d/salida" 2>&1
+              python3 -c "
+          import yaml
+          d = yaml.safe_load(open('compose.yaml'))
+          e = d['services']['vigia']['environment']
+          print(d['services']['runner-1']['environment']['RUNNER_NAME'], e['VIGIA_CLUSTER'], e['VIGIA_HOST'])" )
+          }
+
+          set -- $(nombres proyecto)
+          [ "$1" = "proyecto-${host}-1" ] || { echo "FALLO: runner '$1'"; exit 1; }
+          [ "$2-$3" = "proyecto-${host}" ] || { echo "FALLO: check '$2-$3'"; exit 1; }
+
+          # --prefix tiene que mover LOS DOS. Este es el caso que estaba roto.
+          set -- $(nombres otro-directorio --prefix sherman)
+          [ "$1" = "sherman-${host}-1" ] || { echo "FALLO: --prefix no llegó al runner: '$1'"; exit 1; }
+          [ "$2" = "sherman" ] || { echo "FALLO: --prefix no llegó al cluster: '$2'"; exit 1; }
+          echo "ok: un solo nombre gobierna runners y check"
+
+          # El host se anade solo; si ya esta en el nombre, sale repetido y hay que
+          # decirlo — antes era la unica forma de distinguir maquinas y se arrastra.
+          nombres "proyecto-${host}" >/dev/null
+          grep -q 'AVISO: el nombre del cluster' "$d/salida" \
+            || { echo "FALLO: no avisó del host repetido en el nombre"; cat "$d/salida"; exit 1; }
+          echo "ok: avisa cuando el nombre del cluster ya lleva la máquina"
+
+      # `hostname` DENTRO del contenedor devuelve su ID, que ademas cambia en cada
+      # recreate. Como ese valor forma parte del nombre del check, deducirlo daria
+      # un check nuevo cada vez que se recrea el vigia.
+      - name: El host se pasa al vigía, no se deduce dentro del contenedor
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/vh"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/hooks"; cd "$d"
+          printf '%s sano libre \n' "$(date -u +%s)" > latidos/a
+          informe="$(VIGIA_LATIDOS="$d/latidos" VIGIA_HOOKS="$d/hooks" VIGIA_ESTADO_FILE="$d/e" \
+                     VIGIA_RUNNERS=a VIGIA_CLUSTER=sherman VIGIA_HOST=elmac VIGIA_DESFASE_MAX=999999 \
+                     sh "$GITHUB_WORKSPACE/vigilar.sh" --informe)"
+          echo "$informe" | grep -q 'Máquina: elmac' \
+            || { echo "FALLO: no usó VIGIA_HOST"; echo "$informe"; exit 1; }
+          _hn="$(hostname 2>/dev/null || echo x)"; _hn="${_hn%%.*}"
+          echo "$informe" | grep -q "Máquina: ${_hn}" \
+            && { echo "FALLO: dedujo el host en vez de usar el que le pasan"; exit 1; }
+          echo "ok: el host viene dado, no deducido"
+
   smoke:
     runs-on: ubuntu-latest
     steps:

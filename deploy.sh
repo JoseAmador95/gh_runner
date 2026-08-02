@@ -355,6 +355,12 @@ CLUSTER="${CLUSTER%-}"
 # registro mutuamente en bucle. Las ETIQUETAS no cambian, así que ningún `runs-on`
 # se ve afectado.
 PREFIX="${PREFIX:-${RUNNER_PREFIX:-$CLUSTER}}"
+
+# UN SOLO NOMBRE para el fleet: el que se use de prefijo ES la identidad del
+# cluster. Antes iban por caminos separados —`--prefix sherman` renombraba los
+# runners pero el check seguía llamándose como el directorio—, así que el nombre
+# se bifurcaba y no había forma de arreglar uno sin desalinear el otro.
+CLUSTER="$PREFIX"
 COUNT="${COUNT:-${RUNNER_COUNT:-1}}"
 LABELS="${LABELS:-${RUNNER_LABELS:-}}"
 GROUP="${GROUP:-${RUNNER_GROUP:-}}"
@@ -475,6 +481,22 @@ HOST="$(hostname 2>/dev/null || echo runner)"
 HOST="${HOST%%.*}"
 HOST="$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9_-' '-')"
 [ -n "$HOST" ] || HOST="runner"
+
+# La máquina se AÑADE sola a los dos sitios donde hace falta: los runners se
+# llaman <cluster>-<host>-<n> y el check <cluster>-<host>. Si el nombre del
+# cluster ya trae el host, sale repetido —«sherman-mmja-mmJA-1»— y eso pasó de
+# verdad: antes el check no llevaba la máquina y la única forma de distinguirlos
+# era meterla en el nombre del directorio. Ya no hace falta, así que se avisa en
+# vez de dejar que se arrastre.
+case "$(printf '%s' "$CLUSTER" | tr '[:upper:]' '[:lower:]')" in
+    *"$(printf '%s' "$HOST" | tr '[:upper:]' '[:lower:]')"*)
+        info "AVISO: el nombre del cluster ('$CLUSTER') ya contiene la máquina ('$HOST')."
+        info "  La máquina se añade sola, así que quedará repetida:"
+        info "    runners : ${PREFIX}-${HOST}-1"
+        info "    check   : ${CLUSTER}-${HOST}"
+        info "  Usa --prefix con el nombre del PROYECTO (p. ej. --prefix sherman)."
+        ;;
+esac
 
 # ---- Etiqueta de host ------------------------------------------------------
 # Hasta ahora el único rastro de en qué máquina vive un runner era su NOMBRE, y
@@ -613,6 +635,11 @@ vol_suffix() { printf '%s' "$1" | tr -cd 'A-Za-z0-9'; }
         printf '    command: ["--bucle"]\n'
         printf '    environment:\n'
         printf '      VIGIA_CLUSTER: "%s"\n' "$CLUSTER"
+        # El host se PASA, no se deduce: dentro del contenedor `hostname` devuelve
+        # el ID del contenedor, que además cambia en cada recreate. Como ese valor
+        # forma parte del nombre del check, deducirlo daría un check nuevo cada vez
+        # que se recrea el vigía, y el anterior quedaría huérfano y en rojo.
+        printf '      VIGIA_HOST: "%s"\n' "$HOST"
         # Censo explícito: «no hay latido» solo significa algo si sabes a quién
         # esperabas. Lo sabe deploy.sh, así que lo escribe aquí y el vigía no
         # tiene que adivinarlo ni parsear el compose.
