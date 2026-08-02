@@ -408,7 +408,14 @@ jobs:
         run: |
           set -eu
           d="$RUNNER_TEMP/cuerpo"; rm -rf "$d"; mkdir -p "$d"
-          printf "HC_PING_KEY='PK'\nHC_BASE='http://127.0.0.1:8097'\n" > "$d/conf"
+          # Con API key A PROPÓSITO: es el despliegue bien configurado, y así el
+          # hook no antepone su aviso de "este check nació con periodo de 1 día"
+          # y la comparación de abajo puede seguir siendo BYTE A BYTE, que es lo
+          # que caza un cuerpo sutilmente estropeado. Que el informe sobreviva al
+          # aviso cuando NO hay clave lo cubre el test del hook, más arriba.
+          # HC_API apunta al mismo servidor de prueba: sin eso, la llamada de
+          # configuración saldría a healthchecks.io de verdad desde CI.
+          printf "HC_PING_KEY='PK'\nHC_BASE='http://127.0.0.1:8097'\nHC_API_KEY='AK'\nHC_API='http://127.0.0.1:8097/api/v3'\n" > "$d/conf"
 
           python3 - "$d" <<'PY'
           import http.server, threading, subprocess, sys, time, pathlib
@@ -417,7 +424,12 @@ jobs:
 
           class H(http.server.BaseHTTPRequestHandler):
               def do_POST(self):
-                  cuerpos.append(self.rfile.read(int(self.headers.get('Content-Length', 0))).decode())
+                  cuerpo = self.rfile.read(int(self.headers.get('Content-Length', 0))).decode()
+                  # La llamada de configuración del check (Management API) manda
+                  # JSON y llega ANTES que el ping. Se descarta aquí para que
+                  # cuerpos[0] siga siendo el informe y no el JSON.
+                  if '/api/v3/' not in self.path:
+                      cuerpos.append(cuerpo)
                   self.send_response(200); self.end_headers(); self.wfile.write(b'OK')
               def log_message(self, *a): pass
 
