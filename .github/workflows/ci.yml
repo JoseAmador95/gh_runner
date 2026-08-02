@@ -712,7 +712,13 @@ jobs:
           assert v["command"] == ["--bucle"], v
           # El vigia solo LEE los latidos; los runners los escriben.
           assert "latidos:/var/lib/gh-runner/latidos:ro" in v["volumes"], v["volumes"]
-          assert "./vigia:/etc/gh-runner/vigia:ro" in v["volumes"], v["volumes"]
+          # La `z` NO es cosmetica: sin ella, en Linux con SELinux en enforcing el
+          # contenedor no puede leer este bind mount y el vigia se queda SIN AVISOS
+          # en silencio (medido en Fedora: "Permission denied" dentro, "No hay
+          # hooks ejecutables" en el informe, y el check verde en el panel porque
+          # lo pingaba otra cosa). Los volumenes CON NOMBRE no la necesitan: los
+          # etiqueta el motor al crearlos.
+          assert "./vigia:/etc/gh-runner/vigia:ro,z" in v["volumes"], v["volumes"]
           for n in ("latidos", "vigia-estado"):
               assert n in vols, (n, vols)
           for i in (1, 2, 3):

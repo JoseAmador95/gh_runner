@@ -650,7 +650,25 @@ vol_suffix() { printf '%s' "$1" | tr -cd 'A-Za-z0-9'; }
         # :ro — el vigía solo lee. Un runner comprometido puede falsear su propio
         # latido, pero no los ajenos, y esto además deja clara la dirección.
         printf '      - latidos:/var/lib/gh-runner/latidos:ro\n'
-        printf '      - ./vigia:/etc/gh-runner/vigia:ro\n'
+        # `z` NO es decorativo: sin él, en Linux con SELinux en enforcing este bind
+        # mount deja al vigía SIN AVISOS, y en silencio. Medido en una máquina
+        # Fedora: `ls` dentro del contenedor daba "Permission denied", el vigía
+        # informaba "No hay hooks ejecutables" y su check seguía VERDE en el panel
+        # —lo pingaba la prueba de canal de configurar-avisos.sh al relanzar el
+        # despliegue, no el vigía—, así que parecía vigilada sin estarlo.
+        #
+        # La firma del fallo es que los volúmenes CON NOMBRE (latidos, estado)
+        # funcionan —el motor los etiqueta al crearlos— y solo falla el bind mount
+        # del host. En macOS no hay SELinux, así que el defecto no se ve allí: es
+        # específico de Linux y por eso costó encontrarlo.
+        #
+        # `z` (compartido) y no `Z` (privado): `Z` marca el directorio con una
+        # categoría exclusiva del contenedor, y si algún día lo monta un segundo
+        # contenedor el relabel del último deja al anterior sin acceso. Aquí no
+        # cambia la seguridad efectiva —solo el vigía monta esta ruta, los runners
+        # NO, y en el host va a 700—, así que se elige el que no tiene esa arista.
+        # En macOS y Windows el motor ignora la bandera, así que es portable.
+        printf '      - ./vigia:/etc/gh-runner/vigia:ro,z\n'
         printf '      - vigia-estado:/var/lib/gh-runner/estado\n'
     fi
 
