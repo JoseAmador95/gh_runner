@@ -52,15 +52,23 @@ RUN set -eux; \
 # Además pre-creamos _work y .cache con dueño runner: al montar volúmenes
 # nombrados (Podman rootless) el mountpoint conserva ese dueño en vez de root,
 # lo que evita que actions/checkout falle por permisos.
+#
+# /var/lib/gh-runner/latidos va en la MISMA lista y por el mismo motivo, que aquí
+# es crítico: es el volumen compartido donde cada runner publica su estado y donde
+# el vigía lo lee. Si naciera con dueño root, `runner` no podría escribir y el
+# vigía daría el fleet entero por caído — una falsa alarma permanente.
 USER root
 RUN /home/runner/bin/installdependencies.sh \
-    && mkdir -p /home/runner/_work /home/runner/.cache \
-    && chown -R runner:runner /home/runner/_work /home/runner/.cache
+    && mkdir -p /home/runner/_work /home/runner/.cache /var/lib/gh-runner/latidos \
+    && chown -R runner:runner /home/runner/_work /home/runner/.cache /var/lib/gh-runner/latidos
 USER runner
 
 COPY --chown=runner:runner entrypoint.sh /home/runner/entrypoint.sh
 COPY --chown=runner:runner healthcheck.sh /home/runner/healthcheck.sh
-RUN chmod +x /home/runner/entrypoint.sh /home/runner/healthcheck.sh
+COPY --chown=runner:runner latido.sh /home/runner/latido.sh
+COPY --chown=runner:runner vigilar.sh /home/runner/vigilar.sh
+RUN chmod +x /home/runner/entrypoint.sh /home/runner/healthcheck.sh \
+             /home/runner/latido.sh /home/runner/vigilar.sh
 
 # `restart: always` NO cubre el peor fallo de un runner: quedarse atascado sin
 # poder hablar con GitHub ("Retrying until reconnected", un bucle sin salida).

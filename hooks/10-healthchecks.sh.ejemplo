@@ -3,16 +3,16 @@
 # Hook de vigilar.sh — LATIDO, AVISO POR AUSENCIA E HISTORIAL (healthchecks.io)
 #
 # Para usarlo:
-#   1. cp 10-healthchecks.sh.ejemplo ~/.config/gh-runner/hooks.d/10-healthchecks.sh
-#   2. Pon tu URL de ping abajo.
-#   3. chmod 700 el fichero  <-- contiene una credencial: que no lo lea nadie más.
+#   1. cp 10-healthchecks.sh.ejemplo ./vigia/hooks.d/10-healthchecks.sh
+#   2. Pon tu ping key (o tu URL) en ./vigia/avisos.conf
+#   3. chmod 700 el fichero  <-- puede contener una credencial.
 #
 # QUÉ APORTA, Y POR QUÉ ES EL PRIMERO DE LA FILA:
 # Este es el único que cubre el fallo que la máquina NO puede contar por sí
-# misma: que esté apagada o sin internet. Nadie manda un aviso desde un host
-# muerto. La vuelta es un LATIDO INVERTIDO: mientras todo va bien la máquina
-# hace ping cada ronda, y es el SERVICIO quien avisa cuando el ping deja de
-# llegar. Es el "last will" que Telegram no tiene.
+# misma: que esté apagada, sin internet, o con el motor de contenedores parado.
+# Nadie manda un aviso desde un host muerto. La vuelta es un LATIDO INVERTIDO:
+# mientras todo va bien se hace ping cada ronda, y es el SERVICIO quien avisa
+# cuando el ping deja de llegar. Es el "last will" que Telegram no tiene.
 #
 # Por eso IGNORA a propósito VIGILAR_CAMBIO: tiene que mandarse SIEMPRE, cambie
 # algo o no. Si solo hablara cuando algo cambia, el servicio interpretaría un
@@ -21,51 +21,118 @@
 # El prefijo 10- lo pone el primero de la fila (orden lexicográfico) para que un
 # hook roto más abajo nunca retrase la señal de vida.
 #
-# El anti-spam de las notificaciones sale gratis: healthchecks.io avisa al caer
-# y al recuperarse, y calla mientras no cambie. El enrutado (Telegram, correo,
-# Slack…) se configura en su web, sin tocar este fichero.
+# TRES NIVELES, no dos. healthchecks.io no tiene un estado «warning», pero sí
+# tres finales de URL distintos, y con ellos se construye:
 #
-# NOTA: el informe va como cuerpo del ping, así que el panel guarda el HISTORIAL
-# completo de cada ronda. Que además lo reenvíe al móvil depende de la
-# integración que configures; el mensaje legible NO depende de eso, lo manda
-# 20-telegram.sh por su cuenta.
+#   sano      -> ping normal   : todo bien, y resetea la cuenta atrás
+#   parcial   -> /log          : lo registra CON el informe, sin encender la alarma
+#   degradado -> /fail         : enciende la alarma
 #
-# Es software libre y self-hostable, así que la dependencia es reversible:
-# cambia la URL por la de tu instancia y este hook sigue igual.
+# `parcial` es «algún runner caído pero la CI sigue corriendo». Colapsar eso a
+# binario obliga a elegir entre gritar por un runner de tres o callar cuando ya
+# no queda ninguno.
+#
+# Es software libre y self-hostable, así que la dependencia es reversible: cambia
+# la base por la de tu instancia y este hook sigue igual.
 # ============================================================================
 set -u
 
-# Fichero de configuración opcional, para NO editar este script en cada máquina:
-# si existe, de ahí sale HC_URL. Es lo que permite aprovisionar un host entero
-# con un solo fichero (chmod 600) en vez de a mano, hook por hook.
-CONF="${VIGILAR_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/gh-runner/avisos.conf}"
+# Fichero de configuración, para NO editar este script en cada máquina. Es lo que
+# permite aprovisionar un host entero copiando un solo fichero (chmod 600).
+CONF="${VIGILAR_CONF:-/etc/gh-runner/vigia/avisos.conf}"
 # shellcheck source=/dev/null
 [ -r "$CONF" ] && . "$CONF"
 
-# vvv O EDITA ESTO vvv  (Checks -> tu check -> "Ping URL")
-URL="${HC_URL:-https://hc-ping.com/00000000-0000-0000-0000-000000000000}"
+HC_BASE="${HC_BASE:-https://hc-ping.com}"
+HC_API="${HC_API:-https://healthchecks.io/api/v3}"
+
+# ---- A qué URL se pinga ----------------------------------------------------
+# Dos formas, y HC_URL manda si está: es lo que ya funcionaba y no hay motivo
+# para romperlo.
+#
+#   HC_URL      -> la URL completa de UN check concreto.
+#   HC_PING_KEY -> la ping key del PROYECTO. El check se identifica por su
+#                  nombre (el del cluster) y `?create=1` lo CREA en el primer
+#                  ping. Con esto, el mismo avisos.conf sirve para todas las
+#                  máquinas y montar un cluster nuevo no exige tocar el panel.
+SLUG="$(printf '%s' "${VIGILAR_CLUSTER:-${VIGILAR_HOST:-fleet}}" \
+        | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')"
+SLUG="${SLUG%-}"
+
+if [ -n "${HC_URL:-}" ]; then
+    URL="$HC_URL"; CREAR=""
+elif [ -n "${HC_PING_KEY:-}" ]; then
+    URL="${HC_BASE}/${HC_PING_KEY}/${SLUG}"; CREAR="?create=1"
+else
+    echo "10-healthchecks: falta HC_PING_KEY (o HC_URL) en $CONF" >&2
+    exit 1
+fi
 
 # El informe llega por stdin. Se lee una sola vez.
 INFORME="$(cat)"
 
-# Ruta /fail cuando algo va mal: es lo que enciende el aviso en el panel. Sin
-# sufijo = "sigo viva y todo bien", que además es lo que resetea la cuenta atrás
-# del aviso por ausencia.
-if [ "${VIGILAR_ESTADO:-sano}" = "sano" ]; then
-    DESTINO="$URL"
-else
-    DESTINO="$URL/fail"
+# ---- Provisionar el check con la configuración correcta --------------------
+# `?create=1` crea el check, pero con PERIODO DE 1 DÍA y margen de 1 hora. Para
+# un vigía que late cada 5 minutos eso significa que un host caído tardaría un
+# DÍA en avisar: parecería vigilado sin estarlo. Con una API key se corrige aquí,
+# de una vez y para siempre.
+#
+# `unique: ["slug"]` lo hace idempotente, así que repetirlo en cada ronda no
+# duplica nada. Y NO puede bloquear el ping: si esto falla, el latido sale igual.
+if [ -n "${HC_API_KEY:-}" ] && [ -n "${VIGILAR_CLUSTER:-}" ]; then
+    _periodo="${HC_PERIODO:-900}"      # 15 min: deja pasar dos rondas de 5
+    _margen="${HC_MARGEN:-600}"        # 10 min más antes de gritar
+
+    # Escapar lo que se interpola: esto es JSON construido a mano en shell, que
+    # es donde viven los bugs de comillas. Una comilla en un hostname bastaría
+    # para que el cuerpo dejara de ser JSON válido y el check nunca se
+    # configurase — en silencio, porque el error se traga más abajo.
+    j() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\000-\037'; }
+    _cluster_j="$(j "${VIGILAR_CLUSTER}")"
+    _host_j="$(j "${VIGILAR_HOST:-?}")"
+    # methods:POST no es cosmética: impide que un GET marque el check como vivo.
+    # Las URLs de ping acaban pegadas en chats, y un bot de previsualización de
+    # enlaces haciendo GET daría señal de vida falsa con el fleet muerto.
+    curl -fsS -m 10 --retry 2 -X POST \
+         -H "X-Api-Key: ${HC_API_KEY}" \
+         -H 'Content-Type: application/json' \
+         --data-raw "{
+           \"slug\": \"${SLUG}\",
+           \"unique\": [\"slug\"],
+           \"name\": \"Fleet ${_cluster_j} (${_host_j})\",
+           \"desc\": \"${VIGILAR_ESPERADOS:-?} runners · máquina ${_host_j} · vigía en contenedor\",
+           \"timeout\": ${_periodo},
+           \"grace\": ${_margen},
+           \"tags\": \"gh-runner host:${_host_j} cluster:${_cluster_j}\",
+           \"methods\": \"POST\"
+         }" "${HC_API}/checks/" >/dev/null 2>&1 \
+      || echo "10-healthchecks: no pude configurar el check (sigo con el ping)" >&2
 fi
+
+# ---- El ping ---------------------------------------------------------------
+case "${VIGILAR_ESTADO:-sano}" in
+    sano)    SUFIJO="" ;;
+    parcial) SUFIJO="${HC_SUFIJO_PARCIAL:-/fail}" ;;
+    *)       SUFIJO="/fail" ;;
+esac
+
+# OJO: `parcial` manda /fail por defecto, no /log, y es a propósito. Que /log NO
+# reinicie la cuenta atrás —y que por tanto un degradado sostenido acabe cayendo
+# solo— está DEDUCIDO de la documentación, no escrito en ella. Si la deducción
+# fuera falsa, un fleet a medio morir quedaría en silencio para siempre, que es
+# peor que el exceso de ruido de hoy. Se comprueba con un check de usar y tirar:
+# manda /log, espera a que pase periodo + margen y mira si cae. Si cae, pon
+# HC_SUFIJO_PARCIAL='/log' en avisos.conf y tendrás el nivel intermedio.
 
 # --data-raw @- manda el informe VERBATIM: sin @- curl trataría un texto que
 # empiece por @ como un nombre de fichero, y --data (sin -raw) le quita los
 # saltos de línea, que es justo lo que hace legible la tabla.
-# Reintentos porque una ronda perdida por un blip de red no debe leerse como
-# "la máquina murió"; -m acota para no comerse el timeout del hook.
-curl -fsS -m 10 --retry 2 --retry-delay 2 \
+# --retry 5 con espera creciente es lo que recomienda healthchecks.io: una ronda
+# perdida por un blip de red no debe leerse como "la máquina murió".
+curl -fsS -m 10 --retry 5 \
      -X POST \
      -H 'Content-Type: text/plain; charset=utf-8' \
      --data-raw @- \
-     "$DESTINO" <<INFORME_EOF >/dev/null
+     "${URL}${SUFIJO}${CREAR}" <<INFORME_EOF >/dev/null
 $INFORME
 INFORME_EOF

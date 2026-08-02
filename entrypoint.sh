@@ -62,6 +62,15 @@ for _d in /home/runner/_work /home/runner/.cache ${CACHE_DIRS:-}; do
         || echo "AVISO: no se pudo ajustar el dueño de ${_d}; podría causar errores de permisos en el job." >&2
 done
 
+# ---- Latido para el vigía --------------------------------------------------
+# Va ANTES del backoff a propósito: ese backoff puede durar hasta 300 s, y sin
+# alguien reportando «arrancando» durante ese hueco un runner que se está
+# recuperando parecería uno muerto. El bucle publica el estado en el volumen
+# compartido; si el volumen no está montado, latido.sh no hace nada dañino.
+if [ -x /home/runner/latido.sh ]; then
+    /home/runner/latido.sh &
+fi
+
 # ---- Backoff anti crash-loop (protege el rate limit de GitHub) -------------
 # Cada arranque mintea un registration-token. Si el contenedor falla y
 # restart:always lo relanza al instante, eso martillearía la API de GitHub y

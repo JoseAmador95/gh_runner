@@ -169,7 +169,7 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/JoseAmador95/gh_runner/mai
 | `--no-bootstrap` | No instalar podman/compose ni crear la machine | — |
 | `--vigilar` | Instala el vigía del host: avisa si un runner se cae o se **atasca** (ver §9) | — |
 | `--vigilar-cada N` | Cadencia del vigía (def. `5min`) | — |
-| `--vigilar-hooks RUTA` | Directorio de hooks del vigía (def. `~/.config/gh-runner/hooks.d`) | — |
+| `--vigilar-minimo N` | Runners sanos por debajo de los cuales el estado pasa de `parcial` a `degradado` (def. `1`) | — |
 | `--no-host-label` | No añadir la etiqueta `host:<hostname>` | — |
 | `-h`, `--help` | Ayuda | — |
 
@@ -329,15 +329,28 @@ Caso real que motivó esto: el reloj del host iba **32 minutos atrasado**, así 
 … deploy.sh … --vigilar          # instálalo al desplegar (o vuelve a ejecutarlo con --vigilar)
 ```
 
-Eso deja tres piezas:
+Eso deja cuatro piezas, **todas dentro del compose**:
 
 | Pieza | Dónde | Qué hace |
 |---|---|---|
-| `HEALTHCHECK` | en la **imagen** | Lee el log del propio runner y lo marca `unhealthy` cuando está atascado |
-| `vigilar.sh` | en el **host**, con un timer | Cada 5 min compone un informe: atascados, ausentes y desfase de reloj |
-| Hooks | `~/.config/gh-runner/hooks.d` | Deciden **cómo** te avisan. Reciben el informe completo |
+| `healthcheck.sh` | en cada **runner** | Lee el log del propio runner y decide si está atascado |
+| `latido.sh` | en cada **runner**, en segundo plano | Publica su estado cada 30 s en un volumen compartido |
+| `vigilar.sh` | en el servicio **`vigia`** | Cada 5 min lee los latidos y compone un informe |
+| Hooks | `./vigia/hooks.d` | Deciden **cómo** te avisan. Reciben el informe completo |
 
-El vigía **no repara nada**: diagnostica y avisa. Y **no toca el `compose.yaml`** —ni un servicio extra, ni un volumen, ni el socket de podman montado—, así que activarlo no puede romper un despliegue que ya funciona.
+El vigía **no repara nada**: diagnostica y avisa.
+
+**Corre como un contenedor y no en el host, y eso es la decisión de fondo.** Así el agendado lo hace el motor de contenedores, que es la única capa idéntica en Linux, macOS y Windows: no hay `systemd`, ni `launchd`, ni tarea programada que mantener. Sube y baja con el cluster (`up -d` / `down`).
+
+**No monta el socket del motor.** Cada runner publica su propio estado en un volumen compartido y el vigía lo lee. El socket habría atado el diseño a cada sistema operativo —en macOS vive dentro de la VM de podman— y es una API completa: quien la alcanza puede arrancar un contenedor privilegiado, y estaría al lado de runners que ejecutan PRs de terceros.
+
+**Y si el host se apaga, el vigía cae con él** — de eso avisa healthchecks.io por ausencia de latido, que es el mismo mecanismo que cubre un corte de red o el motor parado.
+
+### Varios clusters en la misma máquina
+
+Cada despliegue vive en su directorio, así que **cada cluster tiene su propio vigía, su propia configuración (`./vigia`) y su propio check**. El nombre del cluster sale del directorio y encabeza cada aviso, así que sabes cuál está caído sin mirar la máquina.
+
+Por el mismo motivo el **prefijo por defecto de los runners es el nombre del cluster** y no un literal fijo: con un prefijo común, dos clusters registraban runners homónimos y —como el runner se registra con `--replace`— se robaban el registro en bucle.
 
 ### Qué detecta
 
@@ -374,7 +387,7 @@ Comprobado: 2026-08-01 15:04:12Z
 `vigilar.sh` **no habla con ningún servicio**. Ejecuta todo lo que sea ejecutable en el directorio de hooks (convención *run-parts*, la de `cron.d` y los hooks de git), en orden alfabético, y les pasa:
 
 - el **informe completo** por **stdin**;
-- `VIGILAR_ESTADO` (`sano` / `degradado`), `VIGILAR_CAMBIO` (`si` / `no`, ¿cambió respecto a la ronda anterior?), `VIGILAR_PRIMERA` (`si` en la primera ronda tras instalar), `VIGILAR_CAIDOS`, `VIGILAR_HOST`, `VIGILAR_ONLINE`, `VIGILAR_ESPERADOS`.
+- `VIGILAR_ESTADO` (`sano` / `parcial` / `degradado`), `VIGILAR_CAMBIO` (`si` / `no`, ¿cambió respecto a la ronda anterior?), `VIGILAR_PRIMERA` (`si` en la primera ronda tras instalar), `VIGILAR_CAIDOS`, `VIGILAR_CLUSTER`, `VIGILAR_HOST`, `VIGILAR_ONLINE`, `VIGILAR_ESPERADOS`.
 
 `VIGILAR_PRIMERA` existe porque la primera ronda y una recuperación llegan **idénticas** —estado sano, cambio sí—, y sin distinguirlas el primer aviso tras instalar diría «runners de vuelta» sin que se hubiera ido nadie. Justo el mensaje que miras para comprobar que el montaje funciona.
 
@@ -385,31 +398,69 @@ Los hooks corren en **cada** ronda; cada uno decide si le importa el cambio. As�
 `--vigilar` deja dos ejemplos listos. Se activan copiándolos **sin** el sufijo `.ejemplo` y rellenando sus datos:
 
 ```bash
-cd ~/.config/gh-runner/hooks.d
+cd ./vigia/hooks.d
 cp 10-healthchecks.sh.ejemplo 10-healthchecks.sh && chmod 700 10-healthchecks.sh
 cp 20-telegram.sh.ejemplo     20-telegram.sh     && chmod 700 20-telegram.sh
 $EDITOR 10-healthchecks.sh 20-telegram.sh        # pon la URL de ping y el token del bot
 ```
 
 **Para no editarlos en cada máquina**, los dos ejemplos leen antes un fichero opcional,
-`~/.config/gh-runner/avisos.conf` (ruta configurable con `VIGILAR_CONF`), y solo caen a su valor
+`./vigia/avisos.conf` (ruta configurable con `VIGILAR_CONF`), y solo caen a su valor
 inline si no existe:
 
 ```sh
-# ~/.config/gh-runner/avisos.conf   -- chmod 600: lleva credenciales
+# ./vigia/avisos.conf   -- chmod 600: lleva credenciales
 HC_URL='https://hc-ping.com/tu-uuid'
 TG_TOKEN='123456:ABC-DEF'
 TG_CHAT='-1001234567890'
 TG_THREAD=''            # opcional
 ```
 
-Con eso, aprovisionar otro host es copiar **un fichero** (`scp avisos.conf otro:~/.config/gh-runner/`)
+Con eso, aprovisionar otro host es copiar **un fichero** (`scp avisos.conf otro:~/despliegue/vigia/`)
 y los hooks quedan tal cual salen del ejemplo. El fichero se **ejecuta** (`.`) desde el hook, así que
 va con `chmod 600` y solo debe escribirlo su dueño — el mismo nivel de confianza que el propio hook.
 
+### Con healthchecks.io: una ping key para todo el fleet
+
+El hook acepta **la URL de un check** (`HC_URL`, lo de siempre) o **la ping key del proyecto**
+(`HC_PING_KEY`). Con la ping key:
+
+```sh
+# ./vigia/avisos.conf — el MISMO fichero sirve para todas las máquinas
+HC_PING_KEY='tu-ping-key'     # Settings del proyecto -> «Ping key»
+HC_API_KEY='tu-api-key'       # opcional, pero léete el aviso de abajo
+```
+
+- El check se identifica por el **nombre del cluster**, y `?create=1` lo **crea en el primer ping**.
+  Montar un cluster nuevo no exige entrar al panel, y el `avisos.conf` deja de ser por máquina.
+- **Con `HC_API_KEY` el vigía configura su propio check** (periodo, margen, nombre, descripción y
+  etiquetas `host:` / `cluster:`) mediante un *upsert* idempotente.
+
+> ⚠️ **Sin `HC_API_KEY`, el check autocreado nace con periodo de 1 DÍA y margen de 1 hora.** Es el
+> valor por defecto de healthchecks.io, y para un vigía que late cada 5 minutos significa que **un
+> host caído tardaría un día en avisar**: parecería vigilado sin estarlo. O das la API key, o ajustas
+> periodo y margen a mano **una vez** por check.
+
+La API key es más poderosa que la ping key —lee y modifica todos los checks del proyecto—, así que es
+opcional a propósito: quien no la quiera en la máquina se queda con el ajuste manual.
+
+**Tres niveles.** healthchecks.io no tiene un estado intermedio, pero sí tres finales de URL:
+
+| Estado del fleet | Ping | Efecto |
+|---|---|---|
+| `sano` | *(sin sufijo)* | Verde, y reinicia la cuenta atrás del aviso por ausencia |
+| `parcial` | `/fail`, o `/log` con `HC_SUFIJO_PARCIAL='/log'` | Con `/log`: queda registrado **sin** encender la alarma |
+| `degradado` | `/fail` | Enciende la alarma |
+
+`parcial` manda `/fail` **por defecto**, y es deliberado: que `/log` no reinicie la cuenta atrás —y
+que por tanto un degradado sostenido acabe cayendo solo— está **deducido** de la documentación, no
+escrito en ella. Compruébalo con un check de usar y tirar (manda `/log`, espera a que pase periodo +
+margen, mira si cae) antes de fiarte; si cae, pon `HC_SUFIJO_PARCIAL='/log'` y tendrás el nivel
+intermedio.
+
 Los dos ejemplos hacen cosas **distintas y complementarias**:
 
-- **`10-healthchecks.sh` — el latido, el aviso por ausencia y el historial.** Es el único que cubre el fallo que la máquina no puede contar por sí misma: **que esté apagada o sin internet**. Nadie manda un aviso desde un host muerto. La vuelta es un **latido invertido**: mientras todo va bien la máquina hace ping cada ronda, y es el **servicio** quien avisa cuando el ping **deja de llegar**. Por eso ignora `VIGILAR_CAMBIO` a propósito: tiene que mandarse siempre. Va con prefijo `10-` para que un hook roto más abajo nunca retrase la señal de vida.
+- **`10-healthchecks.sh` — el latido, el aviso por ausencia y el historial.** Es el único que cubre el fallo que la máquina no puede contar por sí misma: **que esté apagada, sin internet o con el motor de contenedores parado**. Nadie manda un aviso desde un host muerto. La vuelta es un **latido invertido**: mientras todo va bien la máquina hace ping cada ronda, y es el **servicio** quien avisa cuando el ping **deja de llegar**. Por eso ignora `VIGILAR_CAMBIO` a propósito: tiene que mandarse siempre. Va con prefijo `10-` para que un hook roto más abajo nunca retrase la señal de vida.
 
   > De paso responde a **«¿quién vigila al vigía?»**. Si `vigilar.sh` revienta, el timer se para o alguien lo desactiva sin querer, tampoco sale el ping — y el aviso por ausencia salta igual que si la máquina hubiera muerto. Ninguna otra pieza puede dar esa garantía: cualquier cosa que dependa de que el host hable, calla justo cuando hace falta.
 - **`20-telegram.sh` — el mensaje legible.** Manda el informe completo al móvil, directo, y solo cuando algo cambia. Va aparte a propósito: así el mensaje que de verdad quieres leer no depende de cómo formatee un tercero.
@@ -424,16 +475,19 @@ Un hook propio es un script que lee stdin:
 cat | mail -s "Runners de $VIGILAR_HOST: $VIGILAR_ESTADO" yo@ejemplo.com
 ```
 
-### Requisitos y ajustes
+### Ver el estado y ajustar
 
-- **Linux:** el timer es una unidad **de usuario**, igual que `refresh.sh` (§7). Necesita `loginctl enable-linger "$USER"` —que este README ya exige para `podman-restart.service`—; `deploy.sh --vigilar` lo intenta activar solo.
-  ```bash
-  systemctl --user status gh-runner-vigilar.timer   # ver el timer
-  systemctl --user start  gh-runner-vigilar.service # forzar una ronda
-  ```
-- **macOS / Windows:** no hay systemd de usuario; `--vigilar` deja los ficheros listos e **imprime** la línea de `cron`, `launchd` o Task Scheduler que toca. En Windows, `vigilar.sh` lo ejecuta `sh.exe` de Git Bash (`deploy.ps1 -Vigilar` registra la tarea si lo encuentra).
-- **Healthchecks de podman rootless:** podman los implementa con *timers* transitorios de systemd. Si tu entorno no los soporta, el informe dirá `sin check` en vez de `sano` y **no** lo tratará como fallo: seguirás detectando contenedores ausentes y el reloj, pero no el atasco. Para desactivarlos del todo: `healthcheck: {disable: true}` en el compose.
-- **Umbral del reloj:** por defecto avisa a partir de 60 s de desfase (`--desfase-max N` en `vigilar.sh`). Está muy por encima de lo que deja cualquier NTP sano, así que no da falsos avisos — y muy por debajo de lo que rompe un runner.
+```bash
+podman compose logs -f vigia                                   # el informe de cada ronda
+podman compose exec vigia /home/runner/vigilar.sh --informe     # una lectura ahora mismo
+podman compose restart vigia                                    # aplicar un cambio de configuración
+```
+
+- **Igual en los tres sistemas.** No hace falta `loginctl enable-linger` para el vigía: no depende de los *healthchecks* de podman, porque cada runner publica su estado desde dentro. (El `HEALTHCHECK` de la imagen sigue ahí para `podman ps`, pero el camino de vigilancia ya no depende de él.)
+- **Tres niveles, no dos.** `sano`, `parcial` (alguno caído pero **la CI sigue corriendo**) y `degradado`. El umbral es `--vigilar-minimo N`, por defecto 1. Colapsarlo a binario obliga a elegir entre gritar por un runner de tres o callar cuando ya no queda ninguno.
+- **Latido rancio = caído.** Si un runner deja de publicar durante más de `VIGIA_RANCIO` (120 s), se da por caído: cubre el contenedor parado, borrado o congelado. No distingue entre ellos, y operativamente es la misma alerta.
+- **Umbral del reloj:** avisa a partir de 60 s de desfase (`VIGIA_DESFASE_MAX`). Se mide **desde dentro del contenedor**, que es el reloj que los runners usan de verdad; en macOS ese es el de la VM de podman, que es la que se desincroniza al suspender.
+- **Windows:** el bit de ejecución puede no sobrevivir al *bind mount* de `./vigia`. Si el informe dice «Hooks ignorados», corre `podman compose exec vigia chmod +x /etc/gh-runner/vigia/hooks.d/*.sh`.
 
 ---
 
