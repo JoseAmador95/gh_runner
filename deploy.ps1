@@ -47,8 +47,8 @@ param(
     [switch]$Force,
     [switch]$NoBootstrap,
     [switch]$Vigilar,
-    [string]$VigilarCada = '5min',
-    [string]$VigilarHooks,
+    [string]$VigilarCada = '300',
+    [int]$VigilarMinimo = 1,
     [switch]$NoHostLabel,
     [switch]$Help
 )
@@ -116,8 +116,9 @@ Vigilancia (opt-in):
                          y entrega un informe a tus hooks. Detecta el runner
                          ATASCADO (sigue "Up" pero no toma jobs), el contenedor
                          ausente y el reloj desfasado. Requiere Git Bash (sh.exe).
-  -VigilarCada N         Cadencia del vigía (por defecto 5min)
-  -VigilarHooks RUTA     Directorio de hooks (por defecto %APPDATA%\gh-runner\hooks.d)
+  -VigilarCada N         Cadencia de la ronda (por defecto 300; acepta 5min, 1h)
+  -VigilarMinimo N       Runners sanos por debajo de los cuales el estado pasa de
+                         'parcial' (se registra) a 'degradado' (alarma)
   -NoHostLabel           No añadir la etiqueta host:<hostname> a los runners
 
 Ejecución:
@@ -149,7 +150,20 @@ if (-not $Owner) { if ($Interactive) { $Owner = (Read-Host 'Owner del repo (OWNE
 if (-not $Name)  { if ($Interactive) { $Name  = (Read-Host 'Nombre del repo (REPO)').Trim() } else { Die "falta NAME (-Name/-Repo o REPO_NAME)" } }
 if (-not $Owner -or -not $Name) { Die "faltan owner y/o name del repositorio" }
 
-if (-not $Prefix) { $Prefix = if ($env:RUNNER_PREFIX) { $env:RUNNER_PREFIX } else { 'gh' } }
+# El directorio del despliegue: de el salen la identidad del cluster y la ruta de
+# la configuracion del vigia.
+$deployDir = (Get-Location).ProviderPath
+
+# Identidad del cluster: el nombre del directorio del despliegue, saneado. Es lo
+# que distingue dos clusters de la MISMA maquina, y ya es unico por construccion
+# porque el despliegue exige un directorio dedicado.
+$cluster = ((Split-Path -Leaf $deployDir).ToLower() -replace '[^a-z0-9_-]', '-').Trim('-')
+if (-not $cluster) { $cluster = 'gh' }
+
+# El prefijo por defecto es el CLUSTER, no el literal 'gh'. Con 'gh' fijo, dos
+# clusters en la misma maquina generaban runners con nombres identicos y, como
+# entrypoint.sh usa `config.sh --replace`, se robaban el registro en bucle.
+if (-not $Prefix) { $Prefix = if ($env:RUNNER_PREFIX) { $env:RUNNER_PREFIX } else { $cluster } }
 if ($PSBoundParameters.ContainsKey('Count')) {
     if ($Count -lt 1) { Die "-Count debe ser >= 1" }
 }
@@ -399,6 +413,13 @@ if ($Cpus -or $Memory) {
     if ($Cpus) { $c += "        cpus: `"$Cpus`"`n" }
     if ($Memory) { $c += "        memory: $Memory`n" }
 }
+# La cadencia va en SEGUNDOS al compose, pero se acepta la forma de duracion que
+# documentaba el flag cuando esto era una tarea programada (5min, 1h).
+$vigilarCadaSeg = [int](($VigilarCada -replace '[^0-9]', ''))
+if ($VigilarCada -match 'h$')        { $vigilarCadaSeg = $vigilarCadaSeg * 3600 }
+elseif ($VigilarCada -match 'm(in)?$') { $vigilarCadaSeg = $vigilarCadaSeg * 60 }
+if ($vigilarCadaSeg -lt 60) { Die "-VigilarCada: minimo 60 segundos (recibi $VigilarCada)." }
+
 $c += "`nservices:`n"
 for ($i = 1; $i -le $Count; $i++) {
     $c += "  runner-{0}:`n" -f $i
@@ -412,11 +433,44 @@ for ($i = 1; $i -le $Count; $i++) {
     $c += "    volumes:`n"
     $c += "      - runner-{0}-work:/home/runner/_work`n" -f $i
     $c += "      - runner-{0}-cache:/home/runner/.cache`n" -f $i
+    # Volumen compartido donde este runner publica su latido y el vigia lo lee.
+    if ($Vigilar) { $c += "      - latidos:/var/lib/gh-runner/latidos`n" }
     foreach ($cd in $cacheList) {
         $c += "      - runner-{0}-{1}:{2}`n" -f $i, $cd[1], $cd[0]
     }
 }
+
+# ---- El vigia, como un servicio mas ---------------------------------------
+# Paridad con deploy.sh: vive en el compose para que el agendado lo haga el motor
+# de contenedores. En Windows eso ademas elimina la tarea programada, que era la
+# unica pieza del vigia sin cobertura de CI.
+if ($Vigilar) {
+    $nombres = @()
+    for ($i = 1; $i -le $Count; $i++) { $nombres += ("{0}-{1}-{2}" -f $Prefix, $hostShort, $i) }
+    $c += "  vigia:`n"
+    $c += "    image: $Image`n"
+    $c += "    restart: always`n"
+    # Ver el comentario extenso en deploy.sh: ./vigia va a 700 y el usuario
+    # `runner` de la imagen no podria leer su propia configuracion.
+    $c += "    user: `"0:0`"`n"
+    $c += "    entrypoint: [`"/home/runner/vigilar.sh`"]`n"
+    $c += "    command: [`"--bucle`"]`n"
+    $c += "    environment:`n"
+    $c += "      VIGIA_CLUSTER: `"{0}`"`n" -f $cluster
+    $c += "      VIGIA_RUNNERS: `"{0}`"`n" -f ($nombres -join ' ')
+    $c += "      VIGIA_CADA: `"{0}`"`n" -f $vigilarCadaSeg
+    $c += "      VIGIA_MINIMO: `"{0}`"`n" -f $VigilarMinimo
+    $c += "    volumes:`n"
+    $c += "      - latidos:/var/lib/gh-runner/latidos:ro`n"
+    $c += "      - ./vigia:/etc/gh-runner/vigia:ro`n"
+    $c += "      - vigia-estado:/var/lib/gh-runner/estado`n"
+}
+
 $c += "`nvolumes:`n"
+if ($Vigilar) {
+    $c += "  latidos: {}`n"
+    $c += "  vigia-estado: {}`n"
+}
 for ($i = 1; $i -le $Count; $i++) {
     $c += "  runner-{0}-work: {{}}`n" -f $i
     $c += "  runner-{0}-cache: {{}}`n" -f $i
@@ -444,87 +498,42 @@ function Invoke-Compose {
     & $exe @pre @args
 }
 
-# ---- Vigía del host (opt-in con -Vigilar) ----------------------------------
-# Trae al host lo que el compose no puede saber: si un runner está atascado, si
-# falta un contenedor y si el reloj se ha ido. `restart: always` no cubre nada de
-# eso: un runner en "Retrying until reconnected" tiene el proceso vivo, así que
-# el contenedor figura "Up" sin tomar un solo job.
+# ---- Vigía: configuración local del contenedor (opt-in con -Vigilar) -------
+# El vigía YA está en el compose (servicio `vigia`, arriba). Aquí solo se prepara
+# lo que necesita del disco: su directorio de configuración y los hooks de
+# ejemplo. Ya no hay tarea programada que registrar — el agendado lo hace el
+# motor de contenedores, igual que en Linux y macOS.
 #
-# El vigía es vigilar.sh (POSIX sh), compartido con Linux/macOS a propósito: un
-# port a PowerShell sería una segunda implementación que se desincroniza. En
-# Windows lo ejecuta sh.exe de Git Bash, que es el mismo requisito que ya tiene
-# la ruta "Windows con Git Bash" del README.
-function Get-DelRepo($rel, $dest) {
-    if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot $rel))) {
-        Copy-Item (Join-Path $PSScriptRoot $rel) $dest -Force
-        return
-    }
-    try {
-        Invoke-WebRequest -Uri "$RawBase/$rel" -OutFile $dest -UseBasicParsing -ErrorAction Stop
-    } catch {
-        Die "no pude obtener $rel (ni junto al script ni desde $RawBase). Clona el repo y ejecuta deploy.ps1 desde ahí."
-    }
-}
-
+# Ese directorio va en el DESPLIEGUE (.\vigia) y no en %APPDATA%: es lo que
+# permite que dos clusters de la misma máquina avisen por separado.
 function Install-Vigia {
-    $deployDir = (Get-Location).ProviderPath
-    # $script: y no una asignación normal: dentro de una función eso crearía una
-    # variable LOCAL que tapa el parámetro, y el resumen de abajo saldría vacío.
-    if (-not $VigilarHooks) { $script:VigilarHooks = Join-Path $env:APPDATA 'gh-runner\hooks.d' }
+    $vigiaDir = Join-Path $deployDir 'vigia'
+    $hooksDir = Join-Path $vigiaDir 'hooks.d'
+    New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null
 
-    # Cadencia -> minutos (Task Scheduler no entiende "5min").
-    $num = ($VigilarCada -replace '[^0-9]', '')
-    if (-not $num) { $num = '5' }
-    $minutos = [int]$num
-    if ($VigilarCada -match 'h$') { $minutos = $minutos * 60 }
-    elseif ($VigilarCada -match 's$') { $minutos = [Math]::Max(1, [int]($minutos / 60)) }
-    if ($minutos -lt 1) { $minutos = 5 }
-
-    Get-DelRepo 'vigilar.sh' (Join-Path $deployDir 'vigilar.sh')
-    Info "Escrito $deployDir\vigilar.sh"
-
-    # Los hooks son EJEMPLOS con sufijo .ejemplo: no se ejecutan hasta que los
-    # copias sin él. Así instalar el vigía nunca dispara un aviso a medio
-    # configurar, y repetir deploy.ps1 no pisa los que ya tengas puestos.
-    New-Item -ItemType Directory -Force -Path $VigilarHooks | Out-Null
     foreach ($h in @('10-healthchecks.sh', '20-telegram.sh')) {
-        $dest = Join-Path $VigilarHooks "$h.ejemplo"
-        if (-not (Test-Path $dest)) { Get-DelRepo "hooks/$h.ejemplo" $dest }
-    }
-    Info "Hooks de ejemplo en $VigilarHooks (cópialos sin '.ejemplo' y edítalos para activarlos)."
-
-    $sh = (Get-Command 'sh.exe', 'bash.exe' -ErrorAction SilentlyContinue | Select-Object -First 1)
-    if (-not $sh) {
-        Info ""
-        Info "AVISO: no encontré sh.exe/bash.exe (Git Bash), así que NO agendé el vigía."
-        Info "  Instala Git para Windows y vuelve a ejecutar con -Vigilar, o agenda a mano:"
-        Info "    sh.exe `"$deployDir\vigilar.sh`" --hooks `"$VigilarHooks`""
-        return
+        $dest = Join-Path $hooksDir "$h.ejemplo"
+        $act  = Join-Path $hooksDir $h
+        if (-not (Test-Path $dest) -and -not (Test-Path $act)) {
+            Get-DelRepo "hooks/$h.ejemplo" $dest
+        }
     }
 
-    $accion  = New-ScheduledTaskAction -Execute $sh.Source `
-                   -Argument "`"$deployDir\vigilar.sh`" --hooks `"$VigilarHooks`"" `
-                   -WorkingDirectory $deployDir
-    $disparo = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
-                   -RepetitionInterval (New-TimeSpan -Minutes $minutos)
-    try {
-        Register-ScheduledTask -TaskName 'gh-runner-vigilar' -Action $accion -Trigger $disparo `
-            -Description 'Vigia de los runners de GitHub Actions' -Force -ErrorAction Stop | Out-Null
-        Info "Vigía activo: tarea 'gh-runner-vigilar' cada $minutos min."
-        Info "  Comprobar ahora : Start-ScheduledTask -TaskName gh-runner-vigilar"
-        Info "  Ver el informe  : sh.exe `"$deployDir\vigilar.sh`" --informe"
-    } catch {
-        Info ""
-        Info "AVISO: no pude registrar la tarea ($($_.Exception.Message)). Créala a mano:"
-        Info "  schtasks /Create /TN gh-runner-vigilar /SC MINUTE /MO $minutos ``"
-        Info "    /TR `"'$($sh.Source)' '$deployDir\vigilar.sh' --hooks '$VigilarHooks'`""
-    }
+    Info "Vigía: servicio 'vigia' en $File, ronda cada $([int]($vigilarCadaSeg / 60)) min."
+    Info "  Configura los avisos : $vigiaDir\avisos.conf"
+    Info "  Hooks de ejemplo en  : $hooksDir (cópialos sin '.ejemplo' para activarlos)"
+    Info "  Ver el informe       : $compose logs -f vigia"
+    Info ""
+    Info "  OJO en Windows: el bit de ejecución puede no sobrevivir al bind mount."
+    Info "  Si el informe dice 'Hooks ignorados', ejecuta dentro del contenedor:"
+    Info "    $compose exec vigia chmod +x /etc/gh-runner/vigia/hooks.d/*.sh"
 }
 
 if ($Vigilar) {
     Info ""
     Install-Vigia
 }
+
 
 # ---- Resumen ---------------------------------------------------------------
 Info ""
@@ -538,7 +547,7 @@ if ($Cpus -or $Memory) { Info "  Límites : cpus=$(if($Cpus){$Cpus}else{'—'}) 
 $etiquetas = @($Labels, $hostLabel) | Where-Object { $_ }
 if ($etiquetas) { Info "  Etiquetas: $($etiquetas -join ',')" }
 Info "  Motor   : $EngineName ($composeDisplay)"
-if ($Vigilar) { Info "  Vigía   : cada $VigilarCada, hooks en $VigilarHooks" }
+if ($Vigilar) { Info "  Vigía   : servicio 'vigia', ronda cada $([int]($vigilarCadaSeg / 60)) min · config en .\vigia" }
 else { Info "  Vigía   : no (-Vigilar lo instala: avisa si un runner se atasca o se cae)" }
 
 # ---- Levantar el stack -----------------------------------------------------

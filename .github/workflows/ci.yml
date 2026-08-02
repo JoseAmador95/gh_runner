@@ -104,67 +104,222 @@ jobs:
           printf '[%sZ INFO Listener] Listening for Jobs\n' "$ahora" > "$d/_diag/Runner_x.log"
           probar 0 'un job que falla NO es un runner enfermo'
 
-      - name: vigilar.sh informa, dispara los hooks y no se repite
+      - name: latido.sh publica el estado del runner
         run: |
           set -eu
-          d="$RUNNER_TEMP/vg"; rm -rf "$d"; mkdir -p "$d/bin" "$d/hooks"
-          sh ./deploy.sh --no-up --skip-validation --token FAKE --repo o/r --count 3 >/dev/null 2>&1
-          cp compose.yaml "$d/compose.yaml"
+          d="$RUNNER_TEMP/lat"; rm -rf "$d"; mkdir -p "$d/latidos"
+          printf '#!/bin/sh\nexit 0\n' > "$d/sano";  chmod +x "$d/sano"
+          printf '#!/bin/sh\necho "atascado reconectando con GitHub"\nexit 1\n' > "$d/malo"; chmod +x "$d/malo"
 
-          # runner-1 sano, runner-2 atascado, runner-3 sin contenedor.
-          cat > "$d/bin/podman" <<'STUB'
-          #!/bin/sh
-          if [ "$1 $2" = "ps -a" ]; then
-            for a in "$@"; do case "$a" in
-              *".service=runner-1") echo "p_runner-1_1"; exit 0 ;;
-              *".service=runner-2") echo "p_runner-2_1"; exit 0 ;;
-              *".service=runner-3") exit 0 ;;
-            esac; done
-            exit 0
-          fi
-          if [ "$1" = "inspect" ]; then
-            case "$3" in *State.Health.Log*) echo "atascado reconectando con GitHub"; exit 0 ;; esac
-            case "$4" in
-              *runner-1*) echo "running|healthy" ;;
-              *runner-2*) echo "running|unhealthy" ;;
-            esac
-            exit 0
-          fi
-          exit 0
-          STUB
-          chmod +x "$d/bin/podman"
+          lat() {  # $1 = check, $2 = marca de config, $3 = nombre
+            LATIDO_DIR="$d/latidos" LATIDO_CADA=1 LATIDO_HEALTHCHECK="$1" \
+            LATIDO_MARCA_CONFIG="$2" RUNNER_NAME="$3" \
+              timeout 2 sh ./latido.sh 2>/dev/null || true
+          }
 
-          # Un hook que habla siempre (latido), otro solo si cambió (Telegram),
-          # otro que revienta y otro que se cuelga: los dos últimos NO pueden
-          # impedir que los primeros hablen.
-          printf '#!/bin/sh\n{ echo "LATIDO $VIGILAR_ESTADO $VIGILAR_CAMBIO primera=$VIGILAR_PRIMERA"; cat; } >> %s/log\n' "$d" > "$d/hooks/10-latido"
+          # Sin .runner: el runner sigue arrancando (backoff o config.sh). Es un
+          # estado NORMAL: sin nombrarlo, un runner que se recupera parecería muerto.
+          lat "$d/sano" "$d/no-existe" r-arranca
+          grep -q ' arrancando ' "$d/latidos/r-arranca" \
+            || { echo "FALLO: sin .runner debería ser 'arrancando'"; cat "$d/latidos/r-arranca"; exit 1; }
+
+          touch "$d/dot-runner"
+          lat "$d/sano" "$d/dot-runner" r-sano
+          grep -q ' sano ' "$d/latidos/r-sano" || { echo "FALLO: debería ser sano"; exit 1; }
+
+          lat "$d/malo" "$d/dot-runner" r-malo
+          grep -q 'atascado reconectando con GitHub' "$d/latidos/r-malo" \
+            || { echo "FALLO: el motivo de healthcheck.sh no llega al latido"; exit 1; }
+
+          # Escritura atómica: el vigía lee en cualquier momento y no debe pillar
+          # media línea. No pueden quedar temporales.
+          ls -A "$d/latidos" | grep -q '^\.tmp' && { echo "FALLO: quedó un temporal"; exit 1; }
+          echo "ok: latido publica arrancando / sano / atascado, sin dejar temporales"
+
+      - name: vigilar.sh lee los latidos, no el motor de contenedores
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/vg"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/hooks"
+          now="$(date -u +%s)"
+
+          # sano · atascado · rancio (contenedor parado) · arrancando · huérfano.
+          # r-5 no tiene fichero: nunca ha latido.
+          printf '%s sano libre \n'                      "$now"             > "$d/latidos/r-1"
+          printf '%s atascado libre no conecta con GitHub\n' "$now"         > "$d/latidos/r-2"
+          printf '%s sano ocupado \n'                    "$((now - 900))"   > "$d/latidos/r-3"
+          printf '%s arrancando libre \n'                "$now"             > "$d/latidos/r-4"
+          printf '%s sano libre \n'                      "$now"             > "$d/latidos/r-viejo"
+
+          V="VIGIA_LATIDOS=$d/latidos VIGIA_HOOKS=$d/hooks VIGIA_ESTADO_FILE=$d/estado VIGIA_CLUSTER=ci VIGIA_DESFASE_MAX=999999"
+          informe="$(env $V VIGIA_RUNNERS='r-1 r-2 r-3 r-4 r-5' sh ./vigilar.sh --informe)"
+          echo "$informe"
+
+          echo "$informe" | grep -q 'no conecta con GitHub' || { echo "FALLO: el motivo del atasco no llega"; exit 1; }
+          echo "$informe" | grep -q 'sin latido desde hace' || { echo "FALLO: el latido rancio no se detecta"; exit 1; }
+          echo "$informe" | grep -q 'nunca ha latido'       || { echo "FALLO: el runner sin fichero no se detecta"; exit 1; }
+          echo "$informe" | grep -q 'arrancando'            || { echo "FALLO: falta el estado arrancando"; exit 1; }
+          echo "$informe" | grep -q '1/5'                   || { echo "FALLO: el recuento no cuadra"; exit 1; }
+          echo "$informe" | grep -q 'Fleet ci'              || { echo "FALLO: falta la identidad del cluster"; exit 1; }
+
+          # Al bajar de 6 runners a 5, el latido que sobra no debe alarmar.
+          [ -f "$d/latidos/r-viejo" ] && { echo "FALLO: el latido huérfano sigue ahí"; exit 1; }
+          echo "ok: lee latidos, distingue los cinco casos y limpia huérfanos"
+
+      # El criterio no es cuántos fallan, sino si la CI sigue corriendo. Colapsarlo
+      # a binario obliga a elegir entre gritar por un runner de tres o callar
+      # cuando ya no queda ninguno.
+      - name: Tres niveles de estado según si la CI sigue viva
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/niv"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/hooks"
+          printf '#!/bin/sh\necho "$VIGILAR_ESTADO" > %s/nivel\ncat > /dev/null\n' "$d" > "$d/hooks/10-n"
+          chmod +x "$d/hooks/10-n"
+
+          nivel() {  # $1 = sanos, $2 = censo, $3 = minimo
+            rm -f "$d"/latidos/* "$d/estado"
+            now="$(date -u +%s)"
+            for n in $1; do printf '%s sano libre \n' "$now" > "$d/latidos/$n"; done
+            env VIGIA_LATIDOS="$d/latidos" VIGIA_HOOKS="$d/hooks" VIGIA_ESTADO_FILE="$d/estado" \
+                VIGIA_DESFASE_MAX=999999 VIGIA_RUNNERS="$2" VIGIA_MINIMO="$3" \
+                sh ./vigilar.sh >/dev/null 2>&1
+            cat "$d/nivel"
+          }
+
+          [ "$(nivel 'a b c' 'a b c' 1)" = sano ]      || { echo "FALLO: todos sanos debería ser sano"; exit 1; }
+          [ "$(nivel 'a b'   'a b c' 1)" = parcial ]   || { echo "FALLO: con la CI viva debería ser parcial"; exit 1; }
+          [ "$(nivel ''      'a b c' 1)" = degradado ] || { echo "FALLO: sin ninguno debería ser degradado"; exit 1; }
+          [ "$(nivel 'a'     'a b c' 2)" = degradado ] || { echo "FALLO: por debajo del mínimo debería ser degradado"; exit 1; }
+          echo "ok: sano / parcial / degradado, y VIGIA_MINIMO manda"
+
+      # Un reloj desviado con los runners «sanos» es el fallo del 1 de agosto: todo
+      # figuraba Up y nada tomaba jobs. Tiene que ir a rojo por sí solo.
+      - name: El reloj desfasado es degradado aunque los runners se declaren sanos
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/rel"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/hooks" "$d/bin"
+          printf '%s sano libre \n' "$(date -u +%s)" > "$d/latidos/a"
+          # curl falso: GitHub va 30 minutos por delante.
+          printf '#!/bin/sh\nprintf "HTTP/2 200\\r\\nDate: %%s\\r\\n\\r\\n" "$(date -u -d "+30 minutes" "+%%a, %%d %%b %%Y %%H:%%M:%%S GMT")"\n' > "$d/bin/curl"
+          chmod +x "$d/bin/curl"
+          printf '#!/bin/sh\necho "$VIGILAR_ESTADO" > %s/nivel\ncat > /dev/null\n' "$d" > "$d/hooks/10-n"
+          chmod +x "$d/hooks/10-n"
+
+          informe="$(PATH="$d/bin:$PATH" env VIGIA_LATIDOS="$d/latidos" VIGIA_HOOKS="$d/hooks" \
+                     VIGIA_ESTADO_FILE="$d/estado" VIGIA_RUNNERS=a sh ./vigilar.sh)"
+          echo "$informe"
+          echo "$informe" | grep -q 'DESFASADO' || { echo "FALLO: no nombró el desfase"; exit 1; }
+          [ "$(cat "$d/nivel")" = degradado ]   || { echo "FALLO: el reloj desviado debe ser degradado"; exit 1; }
+          echo "ok: el reloj desfasado enciende la alarma por su cuenta"
+
+      - name: Hooks aislados, anti-spam y primera ronda
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/hk"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/hooks"
+          printf '%s sano libre \n' "$(date -u +%s)" > "$d/latidos/a"
+
+          # Uno que habla siempre (latido), otro solo si cambió (Telegram), otro
+          # que revienta y otro que se cuelga: los dos últimos NO pueden impedir
+          # que los primeros hablen.
+          printf '#!/bin/sh\n{ echo "LATIDO $VIGILAR_ESTADO $VIGILAR_CAMBIO primera=$VIGILAR_PRIMERA cluster=$VIGILAR_CLUSTER"; cat; } >> %s/log\n' "$d" > "$d/hooks/10-latido"
           printf '#!/bin/sh\n[ "$VIGILAR_CAMBIO" = si ] || exit 0\necho "TELEGRAM" >> %s/log\n' "$d" > "$d/hooks/20-tg"
           printf '#!/bin/sh\nexit 7\n' > "$d/hooks/30-roto"
           printf '#!/bin/sh\nsleep 300\n' > "$d/hooks/40-colgado"
           printf '#!/bin/sh\necho NO-DEBE-CORRER >> %s/log\n' "$d" > "$d/hooks/50-sin-permiso"
           chmod +x "$d/hooks/10-latido" "$d/hooks/20-tg" "$d/hooks/30-roto" "$d/hooks/40-colgado"
 
-          export PATH="$d/bin:$PATH"
-          cd "$d"
+          V="VIGIA_LATIDOS=$d/latidos VIGIA_HOOKS=$d/hooks VIGIA_ESTADO_FILE=$d/estado VIGIA_CLUSTER=ci VIGIA_DESFASE_MAX=999999 VIGIA_RUNNERS=a"
+          informe="$(env $V sh ./vigilar.sh)"
+          env $V sh ./vigilar.sh >/dev/null 2>&1   # segunda ronda: nada cambió
 
-          informe="$(sh "$GITHUB_WORKSPACE/vigilar.sh" --informe)"
-          echo "$informe"
-          echo "$informe" | grep -q 'atascado' || { echo "FALLO: el atascado no sale en el informe"; exit 1; }
-          echo "$informe" | grep -q 'ausente'  || { echo "FALLO: el ausente no sale en el informe"; exit 1; }
-          echo "$informe" | grep -q '1/3'      || { echo "FALLO: el recuento no cuadra"; exit 1; }
+          grep -q 'NO-DEBE-CORRER' "$d/log" && { echo "FALLO: corrió un hook sin permiso de ejecución"; exit 1; }
+          # Y no basta con no ejecutarlo: hay que DECIRLO, o creerías tener avisos
+          # que no tienes. El bit de ejecución puede no sobrevivir a un bind mount
+          # desde Windows.
+          echo "$informe" | grep -q '50-sin-permiso' || { echo "FALLO: el hook ignorado no se nombra en el informe"; exit 1; }
 
-          V="sh $GITHUB_WORKSPACE/vigilar.sh --hooks $d/hooks --estado $d/estado"
-          $V >/dev/null 2>&1
-          $V >/dev/null 2>&1   # segunda ronda: nada cambió
+          [ "$(grep -c '^LATIDO' "$d/log")" = 2 ]   || { echo "FALLO: el latido debe sonar en CADA ronda"; exit 1; }
+          [ "$(grep -c '^TELEGRAM' "$d/log")" = 1 ] || { echo "FALLO: el aviso debe callar si nada cambió"; exit 1; }
+          grep -q 'primera=si' "$d/log" || { echo "FALLO: la 1ª ronda no se marca"; exit 1; }
+          grep -q 'primera=no' "$d/log" || { echo "FALLO: la 2ª ronda sigue marcada como primera"; exit 1; }
+          grep -q 'cluster=ci' "$d/log" || { echo "FALLO: la identidad del cluster no llega al hook"; exit 1; }
+          echo "ok: hooks aislados, anti-spam, primera ronda e identidad de cluster"
 
-          grep -q 'NO-DEBE-CORRER' log && { echo "FALLO: corrió un hook sin permiso de ejecución"; exit 1; }
-          [ "$(grep -c '^LATIDO' log)" = 2 ] || { echo "FALLO: el latido debe sonar en CADA ronda"; exit 1; }
-          [ "$(grep -c '^TELEGRAM' log)" = 1 ] || { echo "FALLO: el aviso debe callar si nada cambió"; exit 1; }
-          grep -q 'LATIDO degradado si primera=si' log || { echo "FALLO: el estado no llega al hook, o la 1ª ronda no se marca"; exit 1; }
-          # La 2ª ronda NO es la primera: sin esto, una recuperación y el arranque
-          # llegarían idénticos y el primer aviso diría "runners de vuelta".
-          grep -q 'LATIDO degradado no primera=no' log || { echo "FALLO: la 2ª ronda sigue marcada como primera"; exit 1; }
-          echo "ok: informe, hooks aislados, anti-spam y primera ronda"
+      # El hook es quien decide si suena la alarma. Si esto se rompe, el vigía
+      # seguiría funcionando y los avisos irían al sitio equivocado en silencio.
+      - name: El hook de healthchecks.io elige URL y sufijo por nivel
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/hc"; rm -rf "$d"; mkdir -p "$d/bin"
+          printf '#!/bin/sh\nfor a in "$@"; do case "$a" in http*) echo "$a" >> %s/red ;; esac; done\n' "$d" > "$d/bin/curl"
+          chmod +x "$d/bin/curl"
+          cp hooks/10-healthchecks.sh.ejemplo "$d/hc.sh"; chmod +x "$d/hc.sh"
+
+          ping() {  # $1 = estado, $2 = conf extra
+            : > "$d/red"
+            { printf "HC_PING_KEY='PK'\n"; printf '%s\n' "$2"; } > "$d/conf"
+            printf 'informe\n' | PATH="$d/bin:$PATH" env VIGILAR_CONF="$d/conf" \
+              VIGILAR_ESTADO="$1" VIGILAR_CLUSTER=sherman VIGILAR_HOST=ci sh "$d/hc.sh" 2>/dev/null
+            grep -v '/api/v3/' "$d/red" | head -1
+          }
+
+          [ "$(ping sano '')"      = 'https://hc-ping.com/PK/sherman?create=1' ]      || { echo "FALLO: sano"; ping sano ''; exit 1; }
+          [ "$(ping degradado '')" = 'https://hc-ping.com/PK/sherman/fail?create=1' ] || { echo "FALLO: degradado"; exit 1; }
+          # `parcial` manda /fail MIENTRAS no se verifique que /log no reinicia la
+          # cuenta atrás: si no la reiniciara, un fleet a medio morir se quedaría
+          # en silencio para siempre. Se cambia con HC_SUFIJO_PARCIAL.
+          [ "$(ping parcial '')"   = 'https://hc-ping.com/PK/sherman/fail?create=1' ] || { echo "FALLO: parcial por defecto"; exit 1; }
+          [ "$(ping parcial "HC_SUFIJO_PARCIAL='/log'")" = 'https://hc-ping.com/PK/sherman/log?create=1' ] || { echo "FALLO: parcial con /log"; exit 1; }
+
+          # El slug sale del cluster: dos clusters de una misma máquina tienen que
+          # pingear checks DISTINTOS, o el latido sano de uno mantiene verde el
+          # check aunque el otro esté muerto.
+          : > "$d/red"; printf "HC_PING_KEY='PK'\n" > "$d/conf"
+          printf 'informe\n' | PATH="$d/bin:$PATH" env VIGILAR_CONF="$d/conf" VIGILAR_ESTADO=sano \
+            VIGILAR_CLUSTER=otro sh "$d/hc.sh" 2>/dev/null
+          grep -q '/PK/otro' "$d/red" || { echo "FALLO: el slug no sigue al cluster"; exit 1; }
+
+          # HC_URL sigue mandando: es lo que ya funcionaba y no debe romperse.
+          : > "$d/red"; printf "HC_URL='https://hc-ping.com/UUID'\nHC_PING_KEY='PK'\n" > "$d/conf"
+          printf 'informe\n' | PATH="$d/bin:$PATH" env VIGILAR_CONF="$d/conf" VIGILAR_ESTADO=sano \
+            VIGILAR_CLUSTER=sherman sh "$d/hc.sh" 2>/dev/null
+          [ "$(head -1 "$d/red")" = 'https://hc-ping.com/UUID' ] || { echo "FALLO: HC_URL debería tener prioridad"; exit 1; }
+          echo "ok: sufijo por nivel, slug por cluster y compatibilidad con HC_URL"
+
+      # `?create=1` crea el check con periodo de 1 DÍA: parecería vigilado y un
+      # host caído tardaría un día en avisar. La Management API lo corrige.
+      - name: Con API key, el vigía configura su propio check
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/api"; rm -rf "$d"; mkdir -p "$d/bin"
+          cat > "$d/bin/curl" <<'STUB'
+          #!/bin/sh
+          _b=""; _n=0
+          for a in "$@"; do
+            [ "$_n" = 1 ] && { _b="$a"; _n=0; }
+            [ "$a" = "--data-raw" ] && _n=1
+          done
+          case "$*" in *api/v3/checks*) printf '%s' "$_b" > "$API_OUT" ;; esac
+          exit 0
+          STUB
+          chmod +x "$d/bin/curl"
+          cp hooks/10-healthchecks.sh.ejemplo "$d/hc.sh"; chmod +x "$d/hc.sh"
+          printf "HC_PING_KEY='PK'\nHC_API_KEY='AK'\n" > "$d/conf"
+
+          # Un hostname con comillas rompería el JSON hecho a mano en shell.
+          printf 'informe\n' | PATH="$d/bin:$PATH" API_OUT="$d/api.json" env VIGILAR_CONF="$d/conf" \
+            VIGILAR_ESTADO=sano VIGILAR_CLUSTER=sherman VIGILAR_HOST='ma"l"o' VIGILAR_ESPERADOS=3 \
+            sh "$d/hc.sh" 2>/dev/null
+
+          python3 - "$d/api.json" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))          # falla si el escapado se rompió
+          assert d["slug"] == "sherman", d
+          assert d["unique"] == ["slug"], d
+          assert d["timeout"] <= 900 and d["grace"] <= 600, ("periodo del dia por defecto", d)
+          assert d["methods"] == "POST", ("un GET no debe marcar el check como vivo", d)
+          assert "cluster:sherman" in d["tags"], d
+          print("ok: upsert idempotente, periodo corregido y methods=POST")
+          PY
 
   smoke:
     runs-on: ubuntu-latest
@@ -208,12 +363,53 @@ jobs:
       # servicio extra, ni un volumen, ni el socket de podman montado. Esto lo
       # fija, porque es lo que hace que activarla no pueda romper un despliegue
       # existente ni dependa de que el proveedor de compose soporte tal bloque.
-      - name: El vigía NO toca el compose
+
+      # El compose por defecto NO debe cambiar (la asercion de arriba lo fija).
+      # Con --vigilar aparece el vigia, y lo que importa es que quede BIEN
+      # cableado: sin el volumen compartido no ve nada, y sin user 0:0 no puede
+      # leer su propia configuracion en podman rootless.
+      - name: Con --vigilar, el compose cablea el vigía
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/vig-compose"; rm -rf "$d"; mkdir -p "$d"; cd "$d"
+          sh "$GITHUB_WORKSPACE/deploy.sh" --no-up --skip-validation \
+            --token FAKE --repo owner/repo --count 3 --vigilar >/dev/null 2>&1
+          python3 - <<'PY'
+          import yaml
+          doc = yaml.safe_load(open("compose.yaml"))
+          svcs, vols = doc["services"], doc["volumes"]
+          assert "vigia" in svcs, svcs
+          v = svcs["vigia"]
+          assert v["user"] == "0:0", ("sin esto no lee ./vigia en rootless", v)
+          assert v["command"] == ["--bucle"], v
+          # El vigia solo LEE los latidos; los runners los escriben.
+          assert "latidos:/var/lib/gh-runner/latidos:ro" in v["volumes"], v["volumes"]
+          assert "./vigia:/etc/gh-runner/vigia:ro" in v["volumes"], v["volumes"]
+          for n in ("latidos", "vigia-estado"):
+              assert n in vols, (n, vols)
+          for i in (1, 2, 3):
+              r = svcs[f"runner-{i}"]["volumes"]
+              assert "latidos:/var/lib/gh-runner/latidos" in r, (i, r)
+          # El censo es explicito: "no hay latido" solo significa algo si sabes
+          # a quien esperabas.
+          censo = v["environment"]["VIGIA_RUNNERS"].split()
+          assert len(censo) == 3, censo
+          # La identidad sale del directorio, que es lo que separa dos clusters
+          # de una misma maquina.
+          assert v["environment"]["VIGIA_CLUSTER"] == "vig-compose", v["environment"]
+          assert all(c.startswith("vig-compose-") for c in censo), censo
+          print("ok: vigia cableado, censo explicito e identidad por directorio")
+          PY
+      # El servicio del vigía lo añade --vigilar y NADA MÁS (eso lo fija el test
+      # de arriba). Aquí se comprueba lo complementario: sus ajustes por sí solos
+      # no cambian el compose, así que quien no active la vigilancia no ve ni una
+      # línea distinta.
+      - name: Los ajustes del vigía, sin --vigilar, no cambian el compose
         run: |
           set -eu
           mkdir -p "$RUNNER_TEMP/cmp"
           cp compose.yaml "$RUNNER_TEMP/cmp/base.yaml"
-          for extra in "--no-host-label" "--vigilar-cada 2min"; do
+          for extra in "--no-host-label" "--vigilar-cada 2min" "--vigilar-minimo 2"; do
             rm -f compose.yaml .env access_token
             # shellcheck disable=SC2086
             sh ./deploy.sh --no-up --skip-validation \
@@ -221,7 +417,7 @@ jobs:
             diff -u "$RUNNER_TEMP/cmp/base.yaml" compose.yaml \
               || { echo "FALLO: '$extra' cambió el compose"; exit 1; }
           done
-          echo "ok: el compose es idéntico con y sin las opciones del vigía"
+          echo "ok: sin --vigilar el compose no cambia ni una línea"
 
       # La etiqueta de host va en su PROPIA variable. Si se colara dentro de
       # RUNNER_LABELS, borraría el default del entrypoint en los despliegues sin

@@ -32,7 +32,7 @@ set -u
 # Fichero de configuración opcional, para NO editar este script en cada máquina:
 # si existe, de ahí salen TG_TOKEN / TG_CHAT / TG_THREAD. Es lo que permite
 # aprovisionar un host con un solo fichero (chmod 600) en vez de a mano.
-CONF="${VIGILAR_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/gh-runner/avisos.conf}"
+CONF="${VIGILAR_CONF:-/etc/gh-runner/vigia/avisos.conf}"
 # shellcheck source=/dev/null
 [ -r "$CONF" ] && . "$CONF"
 
@@ -53,8 +53,12 @@ ESCAPADO="$(printf '%s' "$INFORME" \
 
 # <pre> = monospace: es lo que mantiene las columnas alineadas en el móvil. Con
 # texto normal, la fuente proporcional descuadra la tabla y se vuelve ilegible.
-if [ "${VIGILAR_ESTADO:-sano}" != "sano" ]; then
+# Tres niveles, no dos: `parcial` es «alguno caído pero la CI sigue corriendo».
+# Mandarlo con el mismo 🔴 que un fleet entero muerto entrena a ignorar el rojo.
+if [ "${VIGILAR_ESTADO:-sano}" = "degradado" ]; then
     TITULO="🔴 Runners en problemas"
+elif [ "${VIGILAR_ESTADO:-sano}" = "parcial" ]; then
+    TITULO="🟡 Fleet a medio gas"
 elif [ "${VIGILAR_PRIMERA:-no}" = "si" ]; then
     # Primera ronda: nada se había ido, así que "de vuelta" seria falso. Además
     # este es el mensaje que confirma que el montaje funciona.
@@ -68,7 +72,7 @@ fi
 set -- \
     --data-urlencode "chat_id=${CHAT}" \
     --data-urlencode "parse_mode=HTML" \
-    --data-urlencode "text=<b>${TITULO}</b> — ${VIGILAR_HOST:-host}
+    --data-urlencode "text=<b>${TITULO}</b> — ${VIGILAR_CLUSTER:-${VIGILAR_HOST:-host}}
 <pre>${ESCAPADO}</pre>"
 [ -n "$THREAD" ] && set -- "$@" --data-urlencode "message_thread_id=${THREAD}"
 

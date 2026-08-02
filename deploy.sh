@@ -61,9 +61,9 @@ SECRET_FILE="access_token"
 ENGINE_PREF=""      # --engine: forzar podman o docker
 BOOTSTRAP="yes"     # instalar podman/compose y crear la machine si faltan (opt-out --no-bootstrap)
 PM=""; MACHINE="no" # los rellena bootstrap_env (gestor de paquetes / si hay VM)
-VIGILAR="no"        # --vigilar: instala el vigía (timer + hooks) en el host
-VIGILAR_CADA="5min" # cadencia del timer del vigía
-VIGILAR_HOOKS=""    # directorio de hooks del vigía (por defecto, bajo XDG_CONFIG_HOME)
+VIGILAR="no"        # --vigilar: añade el servicio `vigia` al compose
+VIGILAR_CADA="300"  # cadencia de la ronda del vigía, en segundos
+VIGILAR_MINIMO="1"  # runners sanos por debajo de los cuales el estado es `degradado`
 HOST_LABEL="yes"    # añade la etiqueta host:<hostname> a los runners (opt-out --no-host-label)
 
 # Separador de la etiqueta de host. En UNA constante a propósito: si GitHub
@@ -225,12 +225,17 @@ Seguridad:
   --token-in-env         Fuerza el modo por defecto (PAT en .env).
 
 Vigilancia (opt-in):
-  --vigilar              Instala el vigía en el host: comprueba los runners cada
-                         pocos minutos y entrega un informe a tus hooks (avisos).
-                         Detecta el runner ATASCADO (el que sigue "Up" pero no
-                         toma jobs), el contenedor ausente y el reloj desfasado.
-  --vigilar-cada N       Cadencia del vigía (por defecto 5min; p.ej. 2min, 15min)
-  --vigilar-hooks RUTA   Directorio de hooks (por defecto ~/.config/gh-runner/hooks.d)
+  --vigilar              Añade al compose el servicio 'vigia': comprueba los
+                         runners cada pocos minutos y entrega un informe a tus
+                         hooks (avisos). Detecta el runner ATASCADO (el que sigue
+                         "Up" pero no toma jobs), el que no reporta y el reloj
+                         desfasado. Sube y baja con el cluster; su configuración
+                         va en ./vigia, así que dos clusters de la misma máquina
+                         avisan por separado.
+  --vigilar-cada N       Cadencia de la ronda (por defecto 300; acepta 5min, 1h)
+  --vigilar-minimo N     Runners sanos por debajo de los cuales el estado pasa de
+                         'parcial' (se registra) a 'degradado' (alarma). Por
+                         defecto 1: con un runner vivo la CI sigue corriendo.
   --no-host-label        No añadir la etiqueta host:<hostname> a los runners
 
 Ejecución:
@@ -277,7 +282,7 @@ while [ "$#" -gt 0 ]; do
         --vigilar)     VIGILAR="yes"; shift ;;
         --no-vigilar)  VIGILAR="no"; shift ;;
         --vigilar-cada)  VIGILAR_CADA="${2:?}"; shift 2 ;;
-        --vigilar-hooks) VIGILAR_HOOKS="${2:?}"; shift 2 ;;
+        --vigilar-minimo) VIGILAR_MINIMO="${2:?}"; shift 2 ;;
         --no-host-label) HOST_LABEL="no"; shift ;;
         -h|--help)     usage 0 ;;
         *) err "opción desconocida: $1 (usa --help)" ;;
@@ -316,8 +321,40 @@ case "$OWNER/$NAME" in
     /*) err "falta el owner del repositorio" ;;
 esac
 
+# La cadencia del vigía va en SEGUNDOS al compose, pero se acepta la forma de
+# duración que documentaba el flag cuando esto era un timer de systemd (5min, 1h)
+# para no romper a quien ya la tenía escrita.
+a_segundos() {
+    case "$1" in
+        *[!0-9smhin]*) err "--vigilar-cada: '$1' no es una duración válida (300, 5min, 1h)" ;;
+    esac
+    _n="$(printf '%s' "$1" | tr -cd '0-9')"
+    [ -n "$_n" ] || err "--vigilar-cada: falta el número en '$1'"
+    case "$1" in
+        *h)         printf '%s' "$(( _n * 3600 ))" ;;
+        *min|*m)    printf '%s' "$(( _n * 60 ))" ;;
+        *s|*[0-9])  printf '%s' "$_n" ;;
+        *)          printf '%s' "$_n" ;;
+    esac
+}
+VIGILAR_CADA="$(a_segundos "$VIGILAR_CADA")"
+[ "$VIGILAR_CADA" -ge 60 ] 2>/dev/null || err "--vigilar-cada: mínimo 60 segundos (recibí ${VIGILAR_CADA}s)."
+case "$VIGILAR_MINIMO" in ''|*[!0-9]*) err "--vigilar-minimo debe ser un número" ;; esac
+
+# Identidad del cluster: el nombre del directorio del despliegue, saneado. Es lo
+# que distingue dos clusters de la MISMA máquina, y ya es único por construcción
+# porque guard_overwrite obliga a un directorio dedicado.
+CLUSTER="$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-')"
+CLUSTER="${CLUSTER%-}"
+[ -n "$CLUSTER" ] || CLUSTER="gh"
+
 # Otros campos: flag -> env -> default.
-PREFIX="${PREFIX:-${RUNNER_PREFIX:-gh}}"
+# El prefijo por defecto es el CLUSTER, no el literal 'gh'. Con 'gh' fijo, dos
+# clusters en la misma máquina generaban runners con nombres idénticos
+# (gh-<host>-1) y, como entrypoint.sh usa `config.sh --replace`, se robaban el
+# registro mutuamente en bucle. Las ETIQUETAS no cambian, así que ningún `runs-on`
+# se ve afectado.
+PREFIX="${PREFIX:-${RUNNER_PREFIX:-$CLUSTER}}"
 COUNT="${COUNT:-${RUNNER_COUNT:-1}}"
 LABELS="${LABELS:-${RUNNER_LABELS:-}}"
 GROUP="${GROUP:-${RUNNER_GROUP:-}}"
@@ -520,6 +557,9 @@ vol_suffix() { printf '%s' "$1" | tr -cd 'A-Za-z0-9'; }
         printf '    volumes:\n'
         printf '      - runner-%s-work:/home/runner/_work\n' "$i"
         printf '      - runner-%s-cache:/home/runner/.cache\n' "$i"
+        # Volumen compartido donde este runner publica su latido y el vigía lo lee.
+        # Solo con --vigilar, para que el compose por defecto no cambie.
+        [ "$VIGILAR" = "yes" ] && printf '      - latidos:/var/lib/gh-runner/latidos\n'
         if [ -n "$CACHE_DIRS_CSV" ]; then
             OLDIFS=$IFS; IFS=,
             for _d in $CACHE_DIRS_CSV; do
@@ -532,8 +572,57 @@ vol_suffix() { printf '%s' "$1" | tr -cd 'A-Za-z0-9'; }
         fi
         i=$((i + 1))
     done
+
+    # ---- El vigía, como un servicio más -----------------------------------
+    # Vive aquí y no en el host porque el agendado lo hace entonces el motor de
+    # contenedores, que es la única capa idéntica en Linux, macOS y Windows.
+    # Sube y baja con el cluster: `up -d` lo enciende, `down` se lo lleva.
+    if [ "$VIGILAR" = "yes" ]; then
+        _nombres=""
+        i=1
+        while [ "$i" -le "$COUNT" ]; do
+            _nombres="$_nombres ${PREFIX}-${HOST}-${i}"
+            i=$((i + 1))
+        done
+        _nombres="${_nombres# }"
+
+        printf '  vigia:\n'
+        printf '    image: %s\n' "$IMAGE"
+        printf '    restart: always\n'
+        # user 0:0 NO es un descuido ni un privilegio de más, y quitarlo rompe los
+        # avisos en silencio. ./vigia guarda secretos (la URL de ping, el token del
+        # bot) y va a 700 en el host. En podman ROOTLESS el usuario del host mapea
+        # al root DEL CONTENEDOR, mientras que el usuario `runner` de la imagen
+        # mapea a un subuid distinto: como `runner` no podría leer su propia
+        # configuración y los hooks no se ejecutarían. Como root del contenedor sí,
+        # y sigue siendo el usuario sin privilegios del host — no se gana acceso a
+        # nada. Este contenedor no monta el socket del motor ni nada del host más
+        # allá de ./vigia en solo lectura.
+        printf '    user: "0:0"\n'
+        printf '    entrypoint: ["/home/runner/vigilar.sh"]\n'
+        printf '    command: ["--bucle"]\n'
+        printf '    environment:\n'
+        printf '      VIGIA_CLUSTER: "%s"\n' "$CLUSTER"
+        # Censo explícito: «no hay latido» solo significa algo si sabes a quién
+        # esperabas. Lo sabe deploy.sh, así que lo escribe aquí y el vigía no
+        # tiene que adivinarlo ni parsear el compose.
+        printf '      VIGIA_RUNNERS: "%s"\n' "$_nombres"
+        printf '      VIGIA_CADA: "%s"\n' "$VIGILAR_CADA"
+        printf '      VIGIA_MINIMO: "%s"\n' "$VIGILAR_MINIMO"
+        printf '    volumes:\n'
+        # :ro — el vigía solo lee. Un runner comprometido puede falsear su propio
+        # latido, pero no los ajenos, y esto además deja clara la dirección.
+        printf '      - latidos:/var/lib/gh-runner/latidos:ro\n'
+        printf '      - ./vigia:/etc/gh-runner/vigia:ro\n'
+        printf '      - vigia-estado:/var/lib/gh-runner/estado\n'
+    fi
+
     printf '\n'
     printf 'volumes:\n'
+    if [ "$VIGILAR" = "yes" ]; then
+        printf '  latidos: {}\n'
+        printf '  vigia-estado: {}\n'
+    fi
     i=1
     while [ "$i" -le "$COUNT" ]; do
         printf '  runner-%s-work: {}\n' "$i"
@@ -557,13 +646,22 @@ vol_suffix() { printf '%s' "$1" | tr -cd 'A-Za-z0-9'; }
 } > "$COMPOSE_FILE"
 info "Escrito $COMPOSE_FILE con $COUNT runner(s)."
 
-# ---- Vigía del host (opt-in con --vigilar) ---------------------------------
-# Trae al host lo que el compose no puede saber: si un runner está atascado, si
-# falta un contenedor y si el reloj se ha ido. `restart: always` no cubre nada de
-# eso — un runner en "Retrying until reconnected" tiene el proceso vivo.
+# ---- Vigía: configuración local del contenedor (opt-in con --vigilar) -------
+# El vigía YA está en el compose (servicio `vigia`, arriba). Aquí solo se prepara
+# lo que necesita del disco del host: su directorio de configuración y los hooks
+# de ejemplo.
+#
+# Ese directorio va en el DESPLIEGUE (./vigia), no en ~/.config, y ese cambio es
+# la solución al multi-cluster: dos clusters de la misma máquina ya tienen
+# directorios distintos (guard_overwrite lo obliga), así que cada uno queda con su
+# configuración y su check sin necesidad de flags nuevas. Con la ruta compartida
+# de antes, ambos pingeaban el MISMO check y el latido sano de uno mantenía el
+# check verde aunque el otro estuviese muerto.
+#
 # El vigía NO maneja secretos: entrega el informe a los hooks y cada hook guarda
 # el suyo. Es deliberado: el .env se inyecta en contenedores que ejecutan código
 # arbitrario de CI, así que un token ahí sería una fuga.
+
 
 # Copia un fichero del repo al directorio del despliegue: si deploy.sh se está
 # ejecutando desde un clon, lo coge del hermano; si vino por curl (sin ficheros
@@ -580,99 +678,22 @@ traer_del_repo() {  # $1 = ruta relativa en el repo, $2 = destino
     curl -fsSL "${RAW_BASE}/$1" -o "$2" || err "no pude bajar $1 desde ${RAW_BASE}.
        Clona el repo y corre deploy.sh desde ahí: coge los ficheros del clon en vez de bajarlos."
 }
+if [ "$VIGILAR" = "yes" ]; then
+    _vigia_dir="$(pwd)/vigia"
+    mkdir -p "${_vigia_dir}/hooks.d"
+    chmod 700 "$_vigia_dir" "${_vigia_dir}/hooks.d" 2>/dev/null || true
 
-instalar_vigia() {
-    _dir_deploy="$(pwd)"
-    [ -n "$VIGILAR_HOOKS" ] || VIGILAR_HOOKS="${XDG_CONFIG_HOME:-$HOME/.config}/gh-runner/hooks.d"
-
-    case "$VIGILAR_CADA" in
-        ''|*[!0-9a-z]*) err "--vigilar-cada debe ser una duración de systemd (5min, 30s, 1h)" ;;
-    esac
-
-    traer_del_repo vigilar.sh "${_dir_deploy}/vigilar.sh"
-    chmod +x "${_dir_deploy}/vigilar.sh"
-    info "Escrito ${_dir_deploy}/vigilar.sh"
-
-    # Los hooks son EJEMPLOS con sufijo .ejemplo: no se ejecutan hasta que los
-    # copias sin él. Así instalar el vigía nunca dispara un aviso a medio
-    # configurar, y volver a correr deploy.sh no pisa los que ya tengas puestos.
-    mkdir -p "$VIGILAR_HOOKS"
-    chmod 700 "$VIGILAR_HOOKS" 2>/dev/null || true
     for _h in 10-healthchecks.sh 20-telegram.sh; do
-        if [ ! -e "${VIGILAR_HOOKS}/${_h}.ejemplo" ]; then
-            traer_del_repo "hooks/${_h}.ejemplo" "${VIGILAR_HOOKS}/${_h}.ejemplo"
+        if [ ! -e "${_vigia_dir}/hooks.d/${_h}" ] && [ ! -e "${_vigia_dir}/hooks.d/${_h}.ejemplo" ]; then
+            traer_del_repo "hooks/${_h}.ejemplo" "${_vigia_dir}/hooks.d/${_h}.ejemplo"
         fi
     done
-    info "Hooks de ejemplo en ${VIGILAR_HOOKS} (cópialos sin '.ejemplo' y edítalos para activarlos)."
 
-    # ¿Hay systemd de usuario? Es lo que el README ya usa para refresh.sh y para
-    # podman-restart.service, así que no se introduce ninguna convención nueva.
-    if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
-        _units="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-        mkdir -p "$_units"
-        cat > "${_units}/gh-runner-vigilar.service" <<EOF
-${MARKER}.sh — no editar a mano.
-[Unit]
-Description=Vigia de los runners de GitHub Actions
-After=network-online.target
-
-[Service]
-Type=oneshot
-WorkingDirectory=${_dir_deploy}
-ExecStart=${_dir_deploy}/vigilar.sh --hooks ${VIGILAR_HOOKS}
-EOF
-        cat > "${_units}/gh-runner-vigilar.timer" <<EOF
-${MARKER}.sh — no editar a mano.
-[Unit]
-Description=Ronda del vigia de runners cada ${VIGILAR_CADA}
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=${VIGILAR_CADA}
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-        systemctl --user daemon-reload
-        systemctl --user enable --now gh-runner-vigilar.timer
-        # Sin linger, el timer muere al cerrar sesión. El README ya lo exige para
-        # podman-restart.service; se intenta aquí y si no se puede, se avisa.
-        if command -v loginctl >/dev/null 2>&1; then
-            loginctl enable-linger "$(id -un)" 2>/dev/null \
-                || info "AVISO: no pude activar linger. Ejecuta: loginctl enable-linger $(id -un)"
-        fi
-        info "Vigía activo: timer gh-runner-vigilar.timer cada ${VIGILAR_CADA}."
-        info "  Comprobar ahora : systemctl --user start gh-runner-vigilar.service"
-        info "  Ver el informe  : ${_dir_deploy}/vigilar.sh --informe"
-    else
-        # La cadencia en minutos para el ejemplo de cron/launchd (systemd acepta
-        # "5min", cron no). Si no se puede deducir, se cae a 5.
-        _min="$(printf '%s' "$VIGILAR_CADA" | tr -cd '0-9')"
-        case "$VIGILAR_CADA" in
-            *h) _min=$(( ${_min:-1} * 60 )) ;;
-            *s) _min=$(( ${_min:-300} / 60 )); [ "$_min" -lt 1 ] && _min=1 ;;
-        esac
-        [ -n "$_min" ] && [ "$_min" -ge 1 ] 2>/dev/null || _min=5
-        # El campo de minutos de cron es 0-59: un "*/90" no dispara cada 90 min,
-        # dispara en el minuto 0 y engaña. A partir de una hora se pasa a horas.
-        if [ "$_min" -ge 60 ]; then
-            _cron="0 */$(( _min / 60 )) * * *"
-        else
-            _cron="*/${_min} * * * *"
-        fi
-        info ""
-        info "AVISO: no hay systemd de usuario, así que NO agendé el vigía. Agéndalo tú:"
-        info "  cron:      ${_cron} cd ${_dir_deploy} && ./vigilar.sh --hooks ${VIGILAR_HOOKS}"
-        info "  macOS:     un agente launchd con StartInterval=$(( _min * 60 )) que corra ./vigilar.sh"
-        info "  Windows:   una tarea de Task Scheduler cada ${_min} min sobre vigilar.sh"
-        info "  Pruébalo:  ${_dir_deploy}/vigilar.sh --informe"
-    fi
-}
-
-if [ "$VIGILAR" = "yes" ]; then
-    info ""
-    instalar_vigia
+    info "Vigía: servicio 'vigia' en $COMPOSE_FILE, ronda cada $(( VIGILAR_CADA / 60 )) min."
+    info "  Configura los avisos : ${_vigia_dir}/avisos.conf"
+    info "  Hooks de ejemplo en  : ${_vigia_dir}/hooks.d (cópialos sin '.ejemplo' para activarlos)"
+    info "  Ver el informe       : $COMPOSE logs -f vigia"
+    info "  Comprobar ahora      : $COMPOSE exec vigia /home/runner/vigilar.sh --informe"
 fi
 
 # ---- Resumen ---------------------------------------------------------------
@@ -698,7 +719,7 @@ fi
 [ -n "$_labels_efectivas" ] && info "  Etiquetas: ${_labels_efectivas}"
 info "  Motor   : ${ENGINE} (${COMPOSE})"
 if [ "$VIGILAR" = "yes" ]; then
-    info "  Vigía   : cada ${VIGILAR_CADA}, hooks en ${VIGILAR_HOOKS}"
+    info "  Vigía   : servicio 'vigia', ronda cada $(( VIGILAR_CADA / 60 )) min · config en ./vigia"
 else
     info "  Vigía   : no (--vigilar lo instala: avisa si un runner se atasca o se cae)"
 fi
