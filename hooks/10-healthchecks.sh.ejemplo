@@ -147,15 +147,23 @@ esac
 # manda /log, espera a que pase periodo + margen y mira si cae. Si cae, pon
 # HC_SUFIJO_PARCIAL='/log' en avisos.conf y tendrás el nivel intermedio.
 
-# --data-raw @- manda el informe VERBATIM: sin @- curl trataría un texto que
-# empiece por @ como un nombre de fichero, y --data (sin -raw) le quita los
-# saltos de línea, que es justo lo que hace legible la tabla.
+# --data-binary @- y NINGUNA de las otras dos, que se parecen y no sirven:
+#
+#   --data-raw @-     manda los dos caracteres «@-». --data-raw existe justo
+#                     para NO interpretar la @, así que aquí no lee nada.
+#   --data @-         sí lee la entrada, pero le QUITA los saltos de línea:
+#                     la tabla llega en un solo renglón, ilegible.
+#   --data-binary @-  lee la entrada y respeta el texto tal cual.  <-- este
+#
+# Medido contra un servidor real; con un curl simulado las tres parecen iguales,
+# que es como se coló el fallo la primera vez.
+#
 # --retry 5 con espera creciente es lo que recomienda healthchecks.io: una ronda
 # perdida por un blip de red no debe leerse como "la máquina murió".
 curl -fsS -m 10 --retry 5 \
      -X POST \
      -H 'Content-Type: text/plain; charset=utf-8' \
-     --data-raw @- \
+     --data-binary @- \
      "${URL}${SUFIJO}${CREAR}" <<INFORME_EOF >/dev/null
 $INFORME
 INFORME_EOF
