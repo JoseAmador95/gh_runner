@@ -431,10 +431,16 @@ HC_PING_KEY='tu-ping-key'     # Settings del proyecto -> «Ping key»
 HC_API_KEY='tu-api-key'       # opcional, pero léete el aviso de abajo
 ```
 
-- El check se identifica por el **nombre del cluster**, y `?create=1` lo **crea en el primer ping**.
-  Montar un cluster nuevo no exige entrar al panel, y el `avisos.conf` deja de ser por máquina.
+- El check se identifica por **cluster + máquina** (`sherman-mmja`), y `?create=1` lo **crea en el
+  primer ping**. Montar un cluster nuevo no exige entrar al panel, y el `avisos.conf` deja de ser por
+  máquina. Las **dos** partes del nombre hacen falta: el cluster sale del directorio del despliegue,
+  que no es único entre máquinas —si todos siguen el README, todas usan el mismo—, y sin la máquina
+  dos hosts compartirían check: el latido sano de uno lo mantendría verde con el otro muerto.
 - **Con `HC_API_KEY` el vigía configura su propio check** (periodo, margen, nombre, descripción y
-  etiquetas `host:` / `cluster:`) mediante un *upsert* idempotente.
+  etiquetas `host:` / `cluster:`) mediante un *upsert* idempotente. El periodo y el margen **se
+  derivan de la cadencia de la ronda**: periodo = 2 rondas (tolera un ping perdido), margen = 1 ronda.
+  Con la cadencia por defecto eso avisa **entre los 10 y los 15 minutos**, y se reajusta solo si
+  cambias `--vigilar-cada`.
 
 > ⚠️ **Sin `HC_API_KEY`, el check autocreado nace con periodo de 1 DÍA y margen de 1 hora.** Es el
 > valor por defecto de healthchecks.io, y para un vigía que late cada 5 minutos significa que **un

@@ -55,9 +55,16 @@ HC_API="${HC_API:-https://healthchecks.io/api/v3}"
 #                  nombre (el del cluster) y `?create=1` lo CREA en el primer
 #                  ping. Con esto, el mismo avisos.conf sirve para todas las
 #                  máquinas y montar un cluster nuevo no exige tocar el panel.
-SLUG="$(printf '%s' "${VIGILAR_CLUSTER:-${VIGILAR_HOST:-fleet}}" \
-        | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')"
-SLUG="${SLUG%-}"
+# EL SLUG LLEVA CLUSTER **Y** MÁQUINA, y las dos partes hacen falta. El cluster
+# sale del nombre del directorio del despliegue, que NO es único entre máquinas:
+# si todo el mundo sigue el README, todas usan el mismo nombre. Sin la máquina,
+# dos hosts pingearían el MISMO check y el latido sano de uno lo mantendría verde
+# aunque el otro estuviera muerto — justo el fallo que esto viene a evitar.
+# Un check corresponde a algo que puede morir por su cuenta: un cluster EN una
+# máquina.
+SLUG="$(printf '%s-%s' "${VIGILAR_CLUSTER:-fleet}" "${VIGILAR_HOST:-sinhost}" \
+        | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | tr -s '-')"
+SLUG="${HC_SLUG:-${SLUG%-}}"
 
 if [ -n "${HC_URL:-}" ]; then
     URL="$HC_URL"; CREAR=""
@@ -80,8 +87,24 @@ INFORME="$(cat)"
 # `unique: ["slug"]` lo hace idempotente, así que repetirlo en cada ronda no
 # duplica nada. Y NO puede bloquear el ping: si esto falla, el latido sale igual.
 if [ -n "${HC_API_KEY:-}" ] && [ -n "${VIGILAR_CLUSTER:-}" ]; then
-    _periodo="${HC_PERIODO:-900}"      # 15 min: deja pasar dos rondas de 5
-    _margen="${HC_MARGEN:-600}"        # 10 min más antes de gritar
+    # Periodo y margen SE DERIVAN DE LA CADENCIA de la ronda, no son constantes:
+    # si alguien cambia --vigilar-cada, estos siguen cuadrando solos.
+    #
+    #   periodo = 2 rondas -> tolera UN ping perdido sin mover ficha
+    #   margen  = 1 ronda  -> absorbe un segundo tropiezo antes de gritar
+    #
+    # Con la cadencia por defecto (300 s) eso avisa entre los 10 y los 15 minutos.
+    # Valores más altos suenan prudentes y no lo son: con un fleet que es la CI
+    # entera, enterarte 25 minutos tarde de que la máquina murió es enterarte
+    # tarde. El hook ya reintenta con espera creciente, así que un hipo de red se
+    # absorbe DENTRO de la ronda y no hace falta comprarlo dos veces aquí.
+    _cada="${VIGILAR_CADA:-300}"
+    case "$_cada" in ''|*[!0-9]*) _cada=300 ;; esac
+    _periodo="${HC_PERIODO:-$(( _cada * 2 ))}"
+    _margen="${HC_MARGEN:-$_cada}"
+    # La API exige 60 s mínimo en ambos.
+    [ "$_periodo" -ge 60 ] || _periodo=60
+    [ "$_margen" -ge 60 ] || _margen=60
 
     # Escapar lo que se interpola: esto es JSON construido a mano en shell, que
     # es donde viven los bugs de comillas. Una comilla en un hostname bastaría

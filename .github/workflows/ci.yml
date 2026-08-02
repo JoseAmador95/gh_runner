@@ -262,21 +262,30 @@ jobs:
             grep -v '/api/v3/' "$d/red" | head -1
           }
 
-          [ "$(ping sano '')"      = 'https://hc-ping.com/PK/sherman?create=1' ]      || { echo "FALLO: sano"; ping sano ''; exit 1; }
-          [ "$(ping degradado '')" = 'https://hc-ping.com/PK/sherman/fail?create=1' ] || { echo "FALLO: degradado"; exit 1; }
+          [ "$(ping sano '')"      = 'https://hc-ping.com/PK/sherman-ci?create=1' ]      || { echo "FALLO: sano"; ping sano ''; exit 1; }
+          [ "$(ping degradado '')" = 'https://hc-ping.com/PK/sherman-ci/fail?create=1' ] || { echo "FALLO: degradado"; exit 1; }
           # `parcial` manda /fail MIENTRAS no se verifique que /log no reinicia la
           # cuenta atrás: si no la reiniciara, un fleet a medio morir se quedaría
           # en silencio para siempre. Se cambia con HC_SUFIJO_PARCIAL.
-          [ "$(ping parcial '')"   = 'https://hc-ping.com/PK/sherman/fail?create=1' ] || { echo "FALLO: parcial por defecto"; exit 1; }
-          [ "$(ping parcial "HC_SUFIJO_PARCIAL='/log'")" = 'https://hc-ping.com/PK/sherman/log?create=1' ] || { echo "FALLO: parcial con /log"; exit 1; }
+          [ "$(ping parcial '')"   = 'https://hc-ping.com/PK/sherman-ci/fail?create=1' ] || { echo "FALLO: parcial por defecto"; exit 1; }
+          [ "$(ping parcial "HC_SUFIJO_PARCIAL='/log'")" = 'https://hc-ping.com/PK/sherman-ci/log?create=1' ] || { echo "FALLO: parcial con /log"; exit 1; }
 
-          # El slug sale del cluster: dos clusters de una misma máquina tienen que
-          # pingear checks DISTINTOS, o el latido sano de uno mantiene verde el
-          # check aunque el otro esté muerto.
-          : > "$d/red"; printf "HC_PING_KEY='PK'\n" > "$d/conf"
-          printf 'informe\n' | PATH="$d/bin:$PATH" env VIGILAR_CONF="$d/conf" VIGILAR_ESTADO=sano \
-            VIGILAR_CLUSTER=otro sh "$d/hc.sh" 2>/dev/null
-          grep -q '/PK/otro' "$d/red" || { echo "FALLO: el slug no sigue al cluster"; exit 1; }
+          # El slug lleva cluster Y MÁQUINA. Dos clusters de un mismo host, y el
+          # MISMO cluster en hosts distintos, tienen que pingear checks separados:
+          # si comparten uno, el latido sano de cualquiera lo mantiene verde
+          # aunque el otro esté muerto. Y como el README manda usar el mismo
+          # comando en todas las máquinas, el nombre de directorio repetido es el
+          # caso NORMAL, no el raro.
+          slug() {  # $1 = cluster, $2 = host
+            : > "$d/red"; printf "HC_PING_KEY='PK'\n" > "$d/conf"
+            printf 'informe\n' | PATH="$d/bin:$PATH" env VIGILAR_CONF="$d/conf" \
+              VIGILAR_ESTADO=sano VIGILAR_CLUSTER="$1" VIGILAR_HOST="$2" sh "$d/hc.sh" 2>/dev/null
+            grep -v '/api/v3/' "$d/red" | head -1
+          }
+          a="$(slug runners mmJA)"; b="$(slug runners otroMac)"; c="$(slug otro mmJA)"
+          [ "$a" != "$b" ] || { echo "FALLO: el MISMO cluster en dos hosts comparte check: $a"; exit 1; }
+          [ "$a" != "$c" ] || { echo "FALLO: dos clusters de un host comparten check: $a"; exit 1; }
+          echo "$a" | grep -q 'runners-mmja' || { echo "FALLO: el slug no lleva cluster y host: $a"; exit 1; }
 
           # HC_URL sigue mandando: es lo que ya funcionaba y no debe romperse.
           : > "$d/red"; printf "HC_URL='https://hc-ping.com/UUID'\nHC_PING_KEY='PK'\n" > "$d/conf"
@@ -313,9 +322,13 @@ jobs:
           python3 - "$d/api.json" <<'PY'
           import json, sys
           d = json.load(open(sys.argv[1]))          # falla si el escapado se rompió
-          assert d["slug"] == "sherman", d
+          # El slug lleva cluster Y host; el host hostil se sanea sin romper el JSON.
+          assert d["slug"].startswith("sherman-"), d
           assert d["unique"] == ["slug"], d
-          assert d["timeout"] <= 900 and d["grace"] <= 600, ("periodo del dia por defecto", d)
+          # Derivados de la cadencia: periodo = 2 rondas, margen = 1 ronda. Con la
+          # cadencia por defecto (300 s) avisa entre los 10 y los 15 minutos. Un
+          # valor mas alto suena prudente y no lo es: el fleet ES la CI.
+          assert d["timeout"] == 600 and d["grace"] == 300, ("umbrales no derivados de la cadencia", d)
           assert d["methods"] == "POST", ("un GET no debe marcar el check como vivo", d)
           assert "cluster:sherman" in d["tags"], d
           print("ok: upsert idempotente, periodo corregido y methods=POST")

@@ -315,6 +315,10 @@ ronda() {
     export VIGILAR_CLUSTER="$CLUSTER"
     export VIGILAR_ONLINE="$ONLINE"
     export VIGILAR_ESPERADOS="$ESPERADOS"
+    # La cadencia viaja a los hooks para que puedan derivar sus propios umbrales
+    # de ella (el de healthchecks.io calcula así el periodo y el margen del check)
+    # en vez de llevar constantes que se desincronizan al cambiar --vigilar-cada.
+    export VIGILAR_CADA="$CADA"
 
     if [ ! -d "$HOOKS_DIR" ]; then
         info "No hay directorio de hooks ($HOOKS_DIR); nadie recibirá el informe."
