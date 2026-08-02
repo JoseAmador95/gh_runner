@@ -502,32 +502,38 @@ jobs:
       - name: latido.sh mide el disco y arrastra el último job
         run: |
           set -eu
-          d="$RUNNER_TEMP/lat2"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/bin"
+          d="$RUNNER_TEMP/lat2"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/libre" "$d/conjob/123"
           printf '#!/bin/sh\nexit 0\n' > "$d/ok"; chmod +x "$d/ok"; touch "$d/cfg"
-          cp "$(command -v sleep)" "$d/bin/Runner.Worker"
+
+          # /proc simulado. Hace falta porque este test corre DENTRO de un runner
+          # de GitHub, que tiene su propio proceso Runner.Worker: mirando el /proc
+          # de verdad, "no hay ningún job" es irreproducible aquí.
+          printf '/home/runner/bin/Runner.Worker\0' > "$d/conjob/123/cmdline"
 
           # LATIDO_TRABAJO apunta a una ruta que existe aquí: en el contenedor es
           # /home/runner/_work, y si no existe el disco sale '-' (degrada solo).
           lat() { LATIDO_DIR="$d/latidos" LATIDO_CADA=1 LATIDO_HEALTHCHECK="$d/ok" \
-                  LATIDO_MARCA_CONFIG="$d/cfg" LATIDO_TRABAJO="$d" RUNNER_NAME=r \
-                  timeout 2 sh ./latido.sh 2>/dev/null || true; }
+                  LATIDO_MARCA_CONFIG="$d/cfg" LATIDO_TRABAJO="$d" LATIDO_PROC="$1" \
+                  RUNNER_NAME=r timeout 2 sh ./latido.sh 2>/dev/null || true; }
 
-          lat
+          lat "$d/libre"
           disco="$(awk '{print $4}' "$d/latidos/r")"
           case "$disco" in ''|*[!0-9]*) echo "FALLO: el disco no es un número: '$disco'"; exit 1 ;; esac
+          [ "$(awk '{print $3}' "$d/latidos/r")" = "libre" ] || { echo "FALLO: sin proceso debería ser libre"; exit 1; }
           [ "$(awk '{print $5}' "$d/latidos/r")" = "-" ] || { echo "FALLO: sin jobs debería ser '-'"; exit 1; }
 
-          "$d/bin/Runner.Worker" 6 & w=$!
-          sleep 0.3; lat; kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+          lat "$d/conjob"
+          [ "$(awk '{print $3}' "$d/latidos/r")" = "ocupado" ] || { echo "FALLO: no vio el job en curso"; exit 1; }
           marca="$(awk '{print $5}' "$d/latidos/r")"
-          case "$marca" in ''|*[!0-9]*) echo "FALLO: no registró el job en curso"; exit 1 ;; esac
+          case "$marca" in ''|*[!0-9]*) echo "FALLO: no registró la marca del job"; exit 1 ;; esac
 
           # Y al quedar libre NO se pierde: es lo que distingue "trabajó hace un
           # rato" de "no ha trabajado nunca".
-          lat
+          lat "$d/libre"
+          [ "$(awk '{print $3}' "$d/latidos/r")" = "libre" ] || { echo "FALLO: debería estar libre"; exit 1; }
           [ "$(awk '{print $5}' "$d/latidos/r")" = "$marca" ] \
             || { echo "FALLO: perdió la marca del último job al quedar libre"; exit 1; }
-          echo "ok: disco medido, y la marca del último job sobrevive"
+          echo "ok: disco medido, ocupado/libre determinista y la marca sobrevive"
 
   smoke:
     runs-on: ubuntu-latest

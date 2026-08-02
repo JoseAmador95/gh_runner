@@ -46,8 +46,12 @@ NOMBRE="$(printf '%s' "${RUNNER_NAME:-runner}" | tr -c 'A-Za-z0-9_.-' '-')"
 # el vigía desde el host. Se lee /proc directamente en vez de usar pgrep porque
 # la imagen NO instala procps: el runner no lo necesita y no vamos a engordarla
 # por esto.
+# PROC es configurable SOLO para poder probar los dos casos: el test corre dentro
+# de un runner de GitHub, que tiene su propio proceso Runner.Worker, así que "no
+# hay ningún job" no se puede reproducir mirando el /proc de verdad.
+PROC="${LATIDO_PROC:-/proc}"
 ocupado() {
-    for _c in /proc/[0-9]*/cmdline; do
+    for _c in "$PROC"/[0-9]*/cmdline; do
         # Solo argv[0] (el ejecutable), no la línea entera: buscando en toda la
         # línea, cualquier proceso que MENCIONE la cadena —un script, el propio
         # grep— contaría como job en curso. Los campos van separados por NUL.
