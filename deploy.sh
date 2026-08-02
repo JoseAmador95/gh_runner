@@ -374,10 +374,20 @@ assert_clean cpus "$CPUS"
 assert_clean memory "$MEMORY"
 assert_clean cache-dirs "$CACHE_DIRS_CSV"
 
-# Token: --token -> ACCESS_TOKEN -> `gh auth token` -> prompt.
+# Token: --token -> ACCESS_TOKEN -> .env anterior -> `gh auth token` -> prompt.
 if [ -z "$TOKEN" ]; then
     if [ -n "${ACCESS_TOKEN:-}" ]; then
         TOKEN="$ACCESS_TOKEN"; TOKEN_SRC="env ACCESS_TOKEN"
+    elif [ -r "$ENV_FILE" ] && [ "$USE_SECRET" != "yes" ] \
+         && case "$(head -n1 "$ENV_FILE" 2>/dev/null || true)" in "$MARKER"*) true ;; *) false ;; esac \
+         && grep -q '^ACCESS_TOKEN=.' "$ENV_FILE" 2>/dev/null; then
+        # Reusa el PAT del .env que escribió una ejecución anterior. Sin esto,
+        # re-ejecutar el comando —que el README documenta como re-ejecutable, y que
+        # se re-ejecuta de verdad cada vez que se ajusta algo— vuelve a pedir el
+        # token a mano cada vez. Solo se acepta si el fichero lo generó deploy.sh
+        # (lleva el marcador) y no estamos en modo --secret, donde el PAT no vive ahí.
+        TOKEN="$(sed -n 's/^ACCESS_TOKEN=//p' "$ENV_FILE" | head -n1)"
+        TOKEN_SRC="$ENV_FILE (ejecución anterior)"
     elif command -v gh >/dev/null 2>&1 && gh auth token >/dev/null 2>&1; then
         TOKEN="$(gh auth token)"; TOKEN_SRC="gh auth token"
     else
