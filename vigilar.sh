@@ -400,6 +400,12 @@ ronda() {
         [ "$_rc" -eq 0 ] || info "AVISO: el hook '$(basename "$_hook")' falló (rc=$_rc); sigo con los demás."
     done
 
+    # Los hooks presentes pero sin `+x` ya se nombran en el informe (SIN_PERMISO,
+    # más arriba). Este mensaje cubre el caso distinto y peor: que el directorio
+    # se vea VACÍO desde el contenedor. En Linux con SELinux, un bind mount sin
+    # `:z` deja al contenedor sin poder leerlo, y entonces no hay ni ficheros que
+    # nombrar. Por eso se dice la ruta: es lo que permite comprobarlo con
+    # `podman compose exec vigia ls -la <ruta>`.
     [ "$_alguno" = "no" ] && info "No hay hooks ejecutables en $HOOKS_DIR; nadie recibirá el informe."
     return 0
 }
