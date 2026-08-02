@@ -458,22 +458,26 @@ escrito en ella. Compruébalo con un check de usar y tirar (manda `/log`, espera
 margen, mira si cae) antes de fiarte; si cae, pon `HC_SUFIJO_PARCIAL='/log'` y tendrás el nivel
 intermedio.
 
-Los dos ejemplos hacen cosas **distintas y complementarias**:
+### Un solo canal: healthchecks.io lo reenvía a donde quieras
 
-- **`10-healthchecks.sh` — el latido, el aviso por ausencia y el historial.** Es el único que cubre el fallo que la máquina no puede contar por sí misma: **que esté apagada, sin internet o con el motor de contenedores parado**. Nadie manda un aviso desde un host muerto. La vuelta es un **latido invertido**: mientras todo va bien la máquina hace ping cada ronda, y es el **servicio** quien avisa cuando el ping **deja de llegar**. Por eso ignora `VIGILAR_CAMBIO` a propósito: tiene que mandarse siempre. Va con prefijo `10-` para que un hook roto más abajo nunca retrase la señal de vida.
+`deploy.sh --vigilar` instala **un** hook, `10-healthchecks.sh`, y es suficiente. Cubre el fallo que
+la máquina no puede contar por sí misma —**que esté apagada o sin internet**—: nadie manda un aviso
+desde un host muerto, así que la vuelta es un **latido invertido**, y es el servicio quien avisa
+cuando el ping **deja de llegar**. Por eso ignora `VIGILAR_CAMBIO` a propósito: tiene que mandarse
+siempre.
 
-  > De paso responde a **«¿quién vigila al vigía?»**. Si `vigilar.sh` revienta, el timer se para o alguien lo desactiva sin querer, tampoco sale el ping — y el aviso por ausencia salta igual que si la máquina hubiera muerto. Ninguna otra pieza puede dar esa garantía: cualquier cosa que dependa de que el host hable, calla justo cuando hace falta.
-- **`20-telegram.sh` — el mensaje legible.** Manda el informe completo al móvil, directo, y solo cuando algo cambia. Va aparte a propósito: así el mensaje que de verdad quieres leer no depende de cómo formatee un tercero.
+**Y el informe llega igual a Telegram.** healthchecks.io reenvía el cuerpo del ping en su
+notificación, envuelto en `<pre>` —monospace, columnas alineadas—, más el nombre del check, el
+proyecto, las etiquetas y **el estado de los demás checks** («The following checks are also down»),
+que con varios clusters es justo lo que quieres saber. El enrutado (Telegram, correo, Slack…) se
+configura **en su web**, sin tocar ninguna máquina.
 
-Sirve cualquier servicio de *heartbeat*; el ejemplo usa [healthchecks.io](https://healthchecks.io) porque tiene rutas separadas para «sigo viva» (`/uuid`) y «algo va mal» (`/uuid/fail`), enruta a Telegram/correo/Slack sin tocar código, y es **software libre y self-hostable** — la dependencia del tercero es reversible cambiando la URL.
+> El cuerpo se recorta a **1000 caracteres** en Telegram. El informe son ~290 con 3 runners y ~940
+> con 20, así que cabe; por encima de eso se corta el final.
 
-Un hook propio es un script que lee stdin:
-
-```sh
-#!/bin/sh
-[ "$VIGILAR_CAMBIO" = "si" ] || exit 0     # solo cuando algo cambia
-cat | mail -s "Runners de $VIGILAR_HOST: $VIGILAR_ESTADO" yo@ejemplo.com
-```
+`hooks/20-telegram.sh.ejemplo` sigue en el repo, pero **ya no se instala por defecto**: mandaba el
+mismo informe al mismo chat, con un segundo secreto que mantener en cada máquina. Actívalo solo si
+quieres un canal **independiente del proveedor** — el precio es dos mensajes por evento.
 
 ### Ver el estado y ajustar
 

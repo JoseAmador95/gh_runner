@@ -511,7 +511,9 @@ function Install-Vigia {
     $hooksDir = Join-Path $vigiaDir 'hooks.d'
     New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null
 
-    foreach ($h in @('10-healthchecks.sh', '20-telegram.sh')) {
+    # Solo el de healthchecks.io: reenvia el informe entero a Telegram/correo/lo
+    # que configures en su web. Ver el comentario extenso en deploy.sh.
+    foreach ($h in @('10-healthchecks.sh')) {
         $dest = Join-Path $hooksDir "$h.ejemplo"
         $act  = Join-Path $hooksDir $h
         if (-not (Test-Path $dest) -and -not (Test-Path $act)) {
