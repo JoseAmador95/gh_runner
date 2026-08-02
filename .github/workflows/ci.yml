@@ -91,7 +91,7 @@ jobs:
   vigia:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Los hooks acaban en .ejemplo, así que la acción de shellcheck no los
       # detecta por extensión; se analizan aquí explícitamente.
