@@ -29,6 +29,61 @@ jobs:
           dockerfile: Containerfile
           failure-threshold: error
 
+  # Todo lo que la imagen COPIA dentro tiene que disparar su reconstrucción. Si
+  # un fichero entra en la imagen y no está en el `paths:` de build-image.yml, un
+  # cambio suyo se queda en main SIN LLEGAR NUNCA A UN RUNNER, y en silencio: no
+  # falla nada, el commit está mergeado, el CI verde, y la imagen vieja.
+  #
+  # Ya pasó: `vigilar.sh` y `latido.sh` entraron en la imagen al containerizar el
+  # vigía, nadie los añadió al `paths:`, y cuatro PRs seguidos que solo tocaban
+  # esos scripts no reconstruyeron nada. El vigía en producción siguió con la
+  # primera versión durante horas — sin ningún síntoma más que un nombre raro en
+  # el panel de avisos.
+  #
+  # El comentario en build-image.yml ya avisaba de esto y no bastó, así que la
+  # lista se comprueba, no se recuerda.
+  imagen-al-dia:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Todo lo que la imagen COPIA dispara su rebuild
+        run: |
+          python3 - <<'PY'
+          import re, sys, yaml
+
+          # Origen de cada COPY (todos los argumentos menos el destino), saltando
+          # las opciones (--chown=…) y los COPY --from=… de otra etapa.
+          copiados = set()
+          for linea in open('Containerfile'):
+              if not re.match(r'\s*COPY\s', linea, re.I):
+                  continue
+              args = [a for a in linea.split()[1:] if not a.startswith('--')]
+              if '--from=' in linea:
+                  continue
+              copiados.update(args[:-1])
+
+          disparan = set(
+              yaml.safe_load(open('.github/workflows/build-image.yml'))
+              [True]['push']['paths']            # `on:` lo parsea YAML como True
+          )
+
+          # Un patrón del paths: puede cubrir varios ficheros (no los hay hoy,
+          # pero que un glob futuro no dé un falso positivo).
+          import fnmatch
+          faltan = sorted(
+              f for f in copiados
+              if not any(fnmatch.fnmatch(f, p) for p in disparan)
+          )
+          if faltan:
+              print('FALLO: estos ficheros entran en la imagen pero NO disparan su rebuild:')
+              for f in faltan:
+                  print(f'  - {f}')
+              print('\nAñádelos al `paths:` de .github/workflows/build-image.yml.')
+              print('Sin eso, cambiarlos NO llega a ningún runner y no lo notarías.')
+              sys.exit(1)
+          print('ok: los %d ficheros de la imagen disparan su rebuild' % len(copiados))
+          PY
+
   # El vigía no tiene forma de fallar en rojo por sí solo (avisa, no rompe), así
   # que su regresión sería SILENCIOSA: creerías tener vigilancia sin tenerla.
   # Esto fija su comportamiento con casos reales, empezando por el fallo que lo
