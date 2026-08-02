@@ -294,6 +294,63 @@ jobs:
           [ "$(head -1 "$d/red")" = 'https://hc-ping.com/UUID' ] || { echo "FALLO: HC_URL debería tener prioridad"; exit 1; }
           echo "ok: sufijo por nivel, slug por cluster y compatibilidad con HC_URL"
 
+
+      # EL TEST QUE FALTABA. Los demás comprueban la URL con un curl simulado, y
+      # así se colo que `--data-raw @-` manda los dos caracteres «@-» en vez del
+      # informe: un stub no reproduce como interpreta curl la @, asi que las tres
+      # variantes parecian iguales. Aqui se levanta un servidor de verdad y se
+      # mira QUE LLEGA. Sin cuerpo, el reenvio a Telegram no lleva nada y todo el
+      # diseno de "el informe viaja en el ping" queda en nada.
+      - name: El informe llega ÍNTEGRO en el cuerpo del ping (curl real)
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/cuerpo"; rm -rf "$d"; mkdir -p "$d"
+          printf "HC_PING_KEY='PK'\nHC_BASE='http://127.0.0.1:8097'\n" > "$d/conf"
+
+          python3 - "$d" <<'PY'
+          import http.server, threading, subprocess, sys, time, pathlib
+          d = pathlib.Path(sys.argv[1])
+          cuerpos = []
+
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  cuerpos.append(self.rfile.read(int(self.headers.get('Content-Length', 0))).decode())
+                  self.send_response(200); self.end_headers(); self.wfile.write(b'OK')
+              def log_message(self, *a): pass
+
+          srv = http.server.HTTPServer(('127.0.0.1', 8097), H)
+          threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+          # Con acentos, varias líneas y espacios de alineación: es lo que hace
+          # legible la tabla en el móvil y lo primero que se pierde si el flag
+          # de curl es el equivocado.
+          informe = ("Fleet sherman-ci — 3/4 en línea\n\n"
+                     "DEGRADADO\n  gh-1   atascado   no conecta con GitHub\n\n"
+                     "EN LÍNEA\n  gh-2   sano       libre\n\n"
+                     "Reloj: +2 s vs GitHub")
+
+          subprocess.run(["sh", "hooks/10-healthchecks.sh.ejemplo"],
+                         input=informe.encode(), capture_output=True,
+                         env={"VIGILAR_CONF": str(d / "conf"), "VIGILAR_ESTADO": "sano",
+                              "VIGILAR_CLUSTER": "sherman", "VIGILAR_HOST": "ci",
+                              "PATH": "/usr/bin:/bin:/usr/local/bin"})
+          time.sleep(0.3)
+
+          if not cuerpos:
+              print("FALLO: no llegó ningún ping"); sys.exit(1)
+          got = cuerpos[0].strip()
+          if got == "@-":
+              print("FALLO: llegó el literal '@-'. --data-raw NO interpreta la @;"
+                    " usa --data-binary @-"); sys.exit(1)
+          if "\n" not in got:
+              print("FALLO: llegó sin saltos de línea (¿--data en vez de"
+                    " --data-binary?): %r" % got); sys.exit(1)
+          if got != informe.strip():
+              print("FALLO: el cuerpo no coincide.\nesperado: %r\nrecibido: %r"
+                    % (informe.strip(), got)); sys.exit(1)
+          print("ok: el informe llega íntegro, con acentos y con la tabla alineada")
+          PY
+
       # `?create=1` crea el check con periodo de 1 DÍA: parecería vigilado y un
       # host caído tardaría un día en avisar. La Management API lo corrige.
       - name: Con API key, el vigía configura su propio check
