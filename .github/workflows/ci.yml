@@ -158,6 +158,22 @@ jobs:
           printf '[%sZ ERR  Worker] Runner connect error: falla el JOB\n' "$ahora" > "$d/_diag/Worker_y.log"
           printf '[%sZ INFO Listener] Listening for Jobs\n' "$ahora" > "$d/_diag/Runner_x.log"
           probar 0 'un job que falla NO es un runner enfermo'
+          rm -f "$d/_diag/Worker_y.log"
+
+          # Reconexión DENTRO de la ventana. El caso de arriba solo cubre el error
+          # que ya salió de los 5 min; este es el que mandaba la falsa alarma:
+          # 15:38:17 Conflict -> 15:39:21 reconectado -> 15:43:13 el vigía seguía
+          # diciendo "atascado" con los cuatro runners tomando jobs.
+          printf '[%sZ ERR  Listener] Runner connect error: Error: Conflict. Retrying until reconnected.\n[%sZ INFO Listener] Runner reconnected.\n[%sZ INFO Listener] Listening for Jobs\n' \
+            "$ahora" "$ahora" "$ahora" > "$d/_diag/Runner_x.log"
+          probar 0 'se reconectó dentro de la ventana => sano'
+
+          # La otra mitad: si el error viene DESPUÉS de la última señal buena, el
+          # runner se volvió a caer y hay que reportarlo. Sin esto, bastaría un
+          # "Listening for Jobs" viejo para enmudecer la alarma para siempre.
+          printf '[%sZ INFO Listener] Listening for Jobs\n[%sZ ERR  Listener] Retrying until reconnected.\n' \
+            "$ahora" "$ahora" > "$d/_diag/Runner_x.log"
+          probar 1 'cayó DESPUÉS de reconectar => unhealthy'
 
       - name: latido.sh publica el estado del runner
         run: |

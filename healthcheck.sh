@@ -19,6 +19,10 @@
 # "Listening for Jobs", porque un runner ejecutando un job está sano y no está
 # escuchando. Fallar en abierto es lo correcto: un falso `unhealthy` despierta a
 # alguien de madrugada para nada, y eso quema la alerta entera.
+#
+# Corolario del mismo principio: una señal de recuperación POSTERIOR al último
+# error lo cancela. No es exigirla —sin ninguna, el fallo se reporta igual—, es
+# no dar por vigente un error que el propio log ya declara superado.
 # ============================================================================
 set -u
 
@@ -55,10 +59,20 @@ motivo="$(
         # Orden a propósito: el último que casa gana, y en la línea del fallo
         # real casan varios a la vez. "Retrying until reconnected" es la firma
         # del atasco (el bucle sin salida), así que va la última.
-        /Access denied|Not authorized/ { m = "GitHub rechaza la credencial" }
-        /Runner connect error/         { m = "no conecta con GitHub" }
-        /Retrying until reconnected/   { m = "atascado reconectando con GitHub" }
-        END { if (m != "") print m }
+        /Access denied|Not authorized/ { m = "GitHub rechaza la credencial"; err = NR }
+        /Runner connect error/         { m = "no conecta con GitHub";        err = NR }
+        /Retrying until reconnected/   { m = "atascado reconectando con GitHub"; err = NR }
+        # Señales de que el bucle TERMINÓ. No contradicen el principio de arriba:
+        # no se EXIGE verlas (sin ninguna, `ok` es 0 y el fallo se reporta igual),
+        # solo cancelan un error que ya quedó atrás. Sin esto, un runner que se
+        # reconecta a los 60 s sigue dando "atascado" hasta que el error sale de
+        # la ventana de 5 min, y el vigía manda una alarma por un fleet sano.
+        # Caso medido: 15:38:17 Conflict -> 15:39:21 Runner reconnected ->
+        # 15:43:13 el vigía lo seguía reportando atascado, con los jobs corriendo.
+        /Runner reconnected|Listening for Jobs|Running job/ { ok = NR }
+        # `err > ok` y no `!ok`: si el error es POSTERIOR a la última señal buena,
+        # el runner volvió a caerse y eso sí hay que reportarlo.
+        END { if (m != "" && err > ok) print m }
     '
 )"
 
