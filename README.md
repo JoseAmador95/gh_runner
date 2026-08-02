@@ -352,6 +352,21 @@ Cada despliegue vive en su directorio, así que **cada cluster tiene su propio v
 
 Por el mismo motivo el **prefijo por defecto de los runners es el nombre del cluster** y no un literal fijo: con un prefijo común, dos clusters registraban runners homónimos y —como el runner se registra con `--replace`— se robaban el registro en bucle.
 
+### Qué mide
+
+Además del estado de cada runner, el informe lleva dos cifras que **no se ven mirando los runners**
+—todos dicen «sano» mientras pasan— y una tercera que ya estaba:
+
+| Métrica | Por qué está | Qué hace |
+|---|---|---|
+| **Disco** (`%` de `_work`) | Se llena y los jobs empiezan a fallar con errores que no señalan la causa | A partir de `--disco-max` (90 %) el estado pasa a **`parcial`** |
+| **Último job** por runner | Un runner con la etiqueta equivocada se queda **`sano · libre` para siempre** y nadie le manda trabajo | Solo informa: sale `sin jobs aún` junto a hermanos que sí trabajaron |
+| **Reloj** vs GitHub | La causa raíz del incidente que originó todo esto | A partir de `VIGIA_DESFASE_MAX` (60 s), **`degradado`** |
+
+El último job **no alarma solo**, y es deliberado: en un fleet tranquilo (noche, fin de semana) que
+nadie tome jobs es lo normal, así que un umbral absoluto daría falsos avisos. Lo que canta es
+**`sin jobs aún` al lado de hermanos que sí trabajaron**, y eso lo ve quien lee.
+
 ### Qué detecta
 
 | Fallo | Cómo se detecta | Latencia |

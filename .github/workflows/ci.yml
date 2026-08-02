@@ -144,11 +144,12 @@ jobs:
 
           # sano · atascado · rancio (contenedor parado) · arrancando · huérfano.
           # r-5 no tiene fichero: nunca ha latido.
-          printf '%s sano libre \n'                      "$now"             > "$d/latidos/r-1"
-          printf '%s atascado libre no conecta con GitHub\n' "$now"         > "$d/latidos/r-2"
-          printf '%s sano ocupado \n'                    "$((now - 900))"   > "$d/latidos/r-3"
-          printf '%s arrancando libre \n'                "$now"             > "$d/latidos/r-4"
-          printf '%s sano libre \n'                      "$now"             > "$d/latidos/r-viejo"
+          # Formato: <epoch> <estado> <ocupado|libre> <disco%|-> <ultimo_job|-> <motivo…>
+          printf '%s sano libre 30 %s \n'                "$now" "$now"      > "$d/latidos/r-1"
+          printf '%s atascado libre 30 - no conecta con GitHub\n' "$now"    > "$d/latidos/r-2"
+          printf '%s sano ocupado 30 %s \n'  "$((now - 900))" "$((now-900))" > "$d/latidos/r-3"
+          printf '%s arrancando libre - - \n'            "$now"             > "$d/latidos/r-4"
+          printf '%s sano libre 30 %s \n'                "$now" "$now"      > "$d/latidos/r-viejo"
 
           V="VIGIA_LATIDOS=$d/latidos VIGIA_HOOKS=$d/hooks VIGIA_ESTADO_FILE=$d/estado VIGIA_CLUSTER=ci VIGIA_DESFASE_MAX=999999"
           informe="$(env $V VIGIA_RUNNERS='r-1 r-2 r-3 r-4 r-5' sh ./vigilar.sh --informe)"
@@ -178,7 +179,7 @@ jobs:
           nivel() {  # $1 = sanos, $2 = censo, $3 = minimo
             rm -f "$d"/latidos/* "$d/estado"
             now="$(date -u +%s)"
-            for n in $1; do printf '%s sano libre \n' "$now" > "$d/latidos/$n"; done
+            for n in $1; do printf '%s sano libre 30 %s \n' "$now" "$now" > "$d/latidos/$n"; done
             env VIGIA_LATIDOS="$d/latidos" VIGIA_HOOKS="$d/hooks" VIGIA_ESTADO_FILE="$d/estado" \
                 VIGIA_DESFASE_MAX=999999 VIGIA_RUNNERS="$2" VIGIA_MINIMO="$3" \
                 sh ./vigilar.sh >/dev/null 2>&1
@@ -197,7 +198,7 @@ jobs:
         run: |
           set -eu
           d="$RUNNER_TEMP/rel"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/hooks" "$d/bin"
-          printf '%s sano libre \n' "$(date -u +%s)" > "$d/latidos/a"
+          printf '%s sano libre 30 %s \n' "$(date -u +%s)" "$(date -u +%s)" > "$d/latidos/a"
           # curl falso: GitHub va 30 minutos por delante.
           printf '#!/bin/sh\nprintf "HTTP/2 200\\r\\nDate: %%s\\r\\n\\r\\n" "$(date -u -d "+30 minutes" "+%%a, %%d %%b %%Y %%H:%%M:%%S GMT")"\n' > "$d/bin/curl"
           chmod +x "$d/bin/curl"
@@ -215,7 +216,7 @@ jobs:
         run: |
           set -eu
           d="$RUNNER_TEMP/hk"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/hooks"
-          printf '%s sano libre \n' "$(date -u +%s)" > "$d/latidos/a"
+          printf '%s sano libre 30 %s \n' "$(date -u +%s)" "$(date -u +%s)" > "$d/latidos/a"
 
           # Uno que habla siempre (latido), otro solo si cambió (Telegram), otro
           # que revienta y otro que se cuelga: los dos últimos NO pueden impedir
@@ -444,7 +445,7 @@ jobs:
         run: |
           set -eu
           d="$RUNNER_TEMP/vh"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/hooks"; cd "$d"
-          printf '%s sano libre \n' "$(date -u +%s)" > latidos/a
+          printf '%s sano libre 30 %s \n' "$(date -u +%s)" "$(date -u +%s)" > latidos/a
           informe="$(VIGIA_LATIDOS="$d/latidos" VIGIA_HOOKS="$d/hooks" VIGIA_ESTADO_FILE="$d/e" \
                      VIGIA_RUNNERS=a VIGIA_CLUSTER=sherman VIGIA_HOST=elmac VIGIA_DESFASE_MAX=999999 \
                      sh "$GITHUB_WORKSPACE/vigilar.sh" --informe)"
@@ -454,6 +455,85 @@ jobs:
           echo "$informe" | grep -q "Máquina: ${_hn}" \
             && { echo "FALLO: dedujo el host en vez de usar el que le pasan"; exit 1; }
           echo "ok: el host viene dado, no deducido"
+
+
+      # Dos fallos que NO se ven mirando el estado de los runners: todos dicen
+      # "sano" mientras el disco se llena, y un runner mal etiquetado se queda
+      # "sano · libre" para siempre porque nadie le manda trabajo.
+      - name: Disco y último job viajan en el latido y salen en el informe
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/met"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/hooks"
+          now="$(date -u +%s)"
+          V="VIGIA_LATIDOS=$d/latidos VIGIA_HOOKS=$d/hooks VIGIA_ESTADO_FILE=$d/e"
+          V="$V VIGIA_CLUSTER=ci VIGIA_HOST=maq VIGIA_DESFASE_MAX=999999"
+
+          # a: trabajó hace 2 h · b: trabajando ahora · c: NUNCA (etiqueta mala)
+          printf '%s sano libre 40 %s \n'   "$now" "$((now - 7200))" > "$d/latidos/a"
+          printf '%s sano ocupado 40 %s \n' "$now" "$now"            > "$d/latidos/b"
+          printf '%s sano libre 40 - \n'    "$now"                   > "$d/latidos/c"
+
+          informe="$(env $V VIGIA_RUNNERS='a b c' sh ./vigilar.sh --informe)"
+          echo "$informe"
+          echo "$informe" | grep -q 'job hace 2 h'  || { echo "FALLO: no sale la antigüedad del último job"; exit 1; }
+          echo "$informe" | grep -q 'sin jobs aún'  || { echo "FALLO: no delata al runner que nunca trabajó"; exit 1; }
+          echo "$informe" | grep -q 'Disco: 40%'    || { echo "FALLO: no sale el disco"; exit 1; }
+          # Con un job en curso la antigüedad sobra: es ahora mismo.
+          echo "$informe" | grep 'ocupado' | grep -q 'job hace' \
+            && { echo "FALLO: repite la antigüedad en un runner ocupado"; exit 1; }
+          echo "ok: último job por runner y disco en el informe"
+
+          # El disco lleno empuja a `parcial`, no a `degradado`: la CI aún corre,
+          # pero hay que actuar antes de que deje de hacerlo.
+          printf '#!/bin/sh\necho "$VIGILAR_ESTADO" > %s/nivel\ncat > /dev/null\n' "$d" > "$d/hooks/10-n"
+          chmod +x "$d/hooks/10-n"
+          for r in a b c; do printf '%s sano libre 93 %s \n' "$now" "$now" > "$d/latidos/$r"; done
+          rm -f "$d/e"
+          informe="$(env $V VIGIA_RUNNERS='a b c' sh ./vigilar.sh)"
+          echo "$informe" | grep -q 'DISCO AL 93%' || { echo "FALLO: no avisó del disco"; exit 1; }
+          [ "$(cat "$d/nivel")" = parcial ] || { echo "FALLO: el disco lleno debería dar parcial, dio $(cat "$d/nivel")"; exit 1; }
+
+          # Y por debajo del umbral NO alarma.
+          for r in a b c; do printf '%s sano libre 40 %s \n' "$now" "$now" > "$d/latidos/$r"; done
+          rm -f "$d/e"; env $V VIGIA_RUNNERS='a b c' sh ./vigilar.sh >/dev/null 2>&1
+          [ "$(cat "$d/nivel")" = sano ] || { echo "FALLO: 40% no debería alarmar"; exit 1; }
+          echo "ok: el disco lleno da parcial, y por debajo del umbral calla"
+
+      - name: latido.sh mide el disco y arrastra el último job
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/lat2"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/libre" "$d/conjob/123"
+          printf '#!/bin/sh\nexit 0\n' > "$d/ok"; chmod +x "$d/ok"; touch "$d/cfg"
+
+          # /proc simulado. Hace falta porque este test corre DENTRO de un runner
+          # de GitHub, que tiene su propio proceso Runner.Worker: mirando el /proc
+          # de verdad, "no hay ningún job" es irreproducible aquí.
+          printf '/home/runner/bin/Runner.Worker\0' > "$d/conjob/123/cmdline"
+
+          # LATIDO_TRABAJO apunta a una ruta que existe aquí: en el contenedor es
+          # /home/runner/_work, y si no existe el disco sale '-' (degrada solo).
+          lat() { LATIDO_DIR="$d/latidos" LATIDO_CADA=1 LATIDO_HEALTHCHECK="$d/ok" \
+                  LATIDO_MARCA_CONFIG="$d/cfg" LATIDO_TRABAJO="$d" LATIDO_PROC="$1" \
+                  RUNNER_NAME=r timeout 2 sh ./latido.sh 2>/dev/null || true; }
+
+          lat "$d/libre"
+          disco="$(awk '{print $4}' "$d/latidos/r")"
+          case "$disco" in ''|*[!0-9]*) echo "FALLO: el disco no es un número: '$disco'"; exit 1 ;; esac
+          [ "$(awk '{print $3}' "$d/latidos/r")" = "libre" ] || { echo "FALLO: sin proceso debería ser libre"; exit 1; }
+          [ "$(awk '{print $5}' "$d/latidos/r")" = "-" ] || { echo "FALLO: sin jobs debería ser '-'"; exit 1; }
+
+          lat "$d/conjob"
+          [ "$(awk '{print $3}' "$d/latidos/r")" = "ocupado" ] || { echo "FALLO: no vio el job en curso"; exit 1; }
+          marca="$(awk '{print $5}' "$d/latidos/r")"
+          case "$marca" in ''|*[!0-9]*) echo "FALLO: no registró la marca del job"; exit 1 ;; esac
+
+          # Y al quedar libre NO se pierde: es lo que distingue "trabajó hace un
+          # rato" de "no ha trabajado nunca".
+          lat "$d/libre"
+          [ "$(awk '{print $3}' "$d/latidos/r")" = "libre" ] || { echo "FALLO: debería estar libre"; exit 1; }
+          [ "$(awk '{print $5}' "$d/latidos/r")" = "$marca" ] \
+            || { echo "FALLO: perdió la marca del último job al quedar libre"; exit 1; }
+          echo "ok: disco medido, ocupado/libre determinista y la marca sobrevive"
 
   smoke:
     runs-on: ubuntu-latest

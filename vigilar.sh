@@ -74,6 +74,10 @@ CADA="${VIGIA_CADA:-300}"
 # muy por encima de lo que deja cualquier NTP sano, así que no da falsos avisos.
 DESFASE_MAX="${VIGIA_DESFASE_MAX:-60}"
 
+# Ocupación de disco (%) a partir de la cual se avisa. 90 deja margen para
+# reaccionar: a partir de ahí una cache o un checkout grande ya puede no caber.
+DISCO_MAX="${VIGIA_DISCO_MAX:-90}"
+
 SOLO_INFORME="no"
 BUCLE="no"
 
@@ -88,6 +92,7 @@ while [ "$#" -gt 0 ]; do
         --minimo)       MINIMO="${2:?falta el valor tras --minimo}"; shift 2 ;;
         --cada)         CADA="${2:?falta el valor tras --cada}"; shift 2 ;;
         --desfase-max)  DESFASE_MAX="${2:?falta el valor tras --desfase-max}"; shift 2 ;;
+        --disco-max)    DISCO_MAX="${2:?falta el valor tras --disco-max}"; shift 2 ;;
         --informe)      SOLO_INFORME="yes"; shift ;;
         --bucle)        BUCLE="yes"; shift ;;
         -h|--help)
@@ -131,6 +136,25 @@ col() {
 # Una fila de la tabla: nombre, estado y detalle.
 fila() { printf '  %s %s %s' "$(col "$1" "$ANCHO")" "$(col "$2" 11)" "$3"; }
 
+# «hace 2 h» a partir de un epoch. Un runner puede estar `sano · libre` PARA
+# SIEMPRE porque se registró con la etiqueta equivocada y nadie le manda trabajo:
+# desde fuera es indistinguible de uno sano. Esto lo delata sin inventar una
+# alarma, porque en un fleet tranquilo (noche, fin de semana) que nadie tome
+# jobs es lo normal; lo que canta es «nunca» al lado de hermanos que sí
+# trabajaron.
+cuando() {
+    # Con un job EN CURSO la antigüedad sobra: es ahora mismo.
+    [ "${3:-}" = "ocupado" ] && return 0
+    [ -n "$1" ] || { printf ' · sin jobs aún'; return 0; }
+    _s=$(( $2 - $1 ))
+    [ "$_s" -lt 0 ] && _s=0
+    if   [ "$_s" -lt 90 ];    then printf ' · job hace %ss' "$_s"
+    elif [ "$_s" -lt 5400 ];  then printf ' · job hace %s min' "$(( _s / 60 ))"
+    elif [ "$_s" -lt 172800 ]; then printf ' · job hace %s h' "$(( _s / 3600 ))"
+    else printf ' · job hace %s d' "$(( _s / 86400 ))"
+    fi
+}
+
 # ---- Desfase del reloj contra GitHub ---------------------------------------
 a_epoch() {
     date -u -d "$1" +%s 2>/dev/null && return 0                                   # GNU
@@ -158,6 +182,7 @@ ronda() {
     ONLINE=0
     ESPERADOS=0
     DESFASE=""      # vacío = no medido
+    DISCO_PICO=""   # el mayor de los runners: en la práctica, el del host
 
     medir_desfase
 
@@ -181,14 +206,25 @@ ronda() {
             continue
         fi
 
-        # Formato: <epoch> <estado> <ocupado|libre> <motivo…>
+        # Formato: <epoch> <estado> <ocupado|libre> <disco%|-> <ultimo_job|-> <motivo…>
         _linea="$(cat "$_f" 2>/dev/null || true)"
         _sello="${_linea%% *}"; _resto="${_linea#* }"
         _est="${_resto%% *}";   _resto="${_resto#* }"
-        _act="${_resto%% *}"
+        _act="${_resto%% *}";   _resto="${_resto#* }"
+        _disco="${_resto%% *}"; _resto="${_resto#* }"
+        _ult="${_resto%% *}"
         _motivo="${_resto#* }"
-        [ "$_motivo" = "$_act" ] && _motivo=""
+        [ "$_motivo" = "$_ult" ] && _motivo=""
         case "$_sello" in ''|*[!0-9]*) _sello=0 ;; esac
+        case "$_disco" in ''|*[!0-9]*) _disco="" ;; esac
+        case "$_ult"   in ''|*[!0-9]*) _ult="" ;; esac
+
+        # El disco es del sistema de ficheros, así que en la práctica es del HOST:
+        # todos los runners de una máquina devuelven lo mismo. Se queda el mayor y
+        # se reporta UNA vez, en vez de repetir la misma cifra en cada fila.
+        if [ -n "$_disco" ] && [ "$_disco" -gt "${DISCO_PICO:-0}" ]; then
+            DISCO_PICO="$_disco"
+        fi
 
         _edad=$(( _ahora - _sello ))
         if [ "$_edad" -gt "$RANCIO" ]; then
@@ -203,7 +239,7 @@ ronda() {
 
         case "$_est" in
             sano)
-                SANOS="${SANOS}$(fila "$_nombre" "sano" "$_act")
+                SANOS="${SANOS}$(fila "$_nombre" "sano" "$_act$(cuando "$_ult" "$_ahora" "$_act")")
 "
                 ONLINE=$(( ONLINE + 1 ))
                 HUELLA="$HUELLA$_nombre=ok;"
@@ -232,7 +268,7 @@ ronda() {
     for _f in "$LATIDOS_DIR"/*; do
         [ -f "$_f" ] || continue
         _b="$(basename "$_f")"
-        case "$_b" in .tmp.*) continue ;; esac
+        case "$_b" in .*) continue ;; esac
         _conocido="no"
         for _nombre in $RUNNERS; do
             [ "$_b" = "$(sanear "$_nombre")" ] && { _conocido="si"; break; }
@@ -261,6 +297,17 @@ ronda() {
         fi
     fi
 
+    # Disco: como el reloj, es un fallo que NO se ve mirando los runners —todos
+    # dicen «sano» hasta que un job revienta con un error que no señala la causa—.
+    # Empuja a `parcial` y no a `degradado`: la CI aún corre, pero hay que actuar
+    # antes de que deje de hacerlo.
+    AVISO_DISCO=""
+    if [ -n "$DISCO_PICO" ] && [ "$DISCO_PICO" -ge "$DISCO_MAX" ]; then
+        [ "$ESTADO" = "degradado" ] || ESTADO="parcial"
+        AVISO_DISCO="  DISCO AL ${DISCO_PICO}%: los jobs empezarán a fallar con errores que no lo señalan."
+        HUELLA="${HUELLA}disco=lleno;"
+    fi
+
     # Un hook sin permiso de ejecución se ignoraría en silencio y creerías tener
     # avisos que no tienes. Se nombra en el informe. Pasa de verdad: el bit de
     # ejecución puede no sobrevivir a un bind mount desde Windows.
@@ -284,6 +331,10 @@ ronda() {
             [ -n "$AVISO_RELOJ" ] && printf '%s\n' "$AVISO_RELOJ"
         else
             printf 'Reloj: no medido (sin red o sin `date` compatible)\n'
+        fi
+        if [ -n "$DISCO_PICO" ]; then
+            printf 'Disco: %s%% usado\n' "$DISCO_PICO"
+            [ -n "$AVISO_DISCO" ] && printf '%s\n' "$AVISO_DISCO"
         fi
         [ -n "$SIN_PERMISO" ] && printf 'Hooks ignorados (sin permiso de ejecución):%s\n' "$SIN_PERMISO"
         printf 'Máquina: %s · Comprobado: %s\n' "$HOSTNAME_CORTO" "$(date -u '+%Y-%m-%d %H:%M:%SZ')"
