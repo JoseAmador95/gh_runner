@@ -689,11 +689,10 @@ if [ "$VIGILAR" = "yes" ]; then
     # hook mandando lo mismo al mismo chat era un duplicado con un secreto extra
     # que mantener en cada máquina. El ejemplo de Telegram sigue en el repo para
     # quien quiera un canal independiente del proveedor.
-    for _h in 10-healthchecks.sh; do
-        if [ ! -e "${_vigia_dir}/hooks.d/${_h}" ] && [ ! -e "${_vigia_dir}/hooks.d/${_h}.ejemplo" ]; then
-            traer_del_repo "hooks/${_h}.ejemplo" "${_vigia_dir}/hooks.d/${_h}.ejemplo"
-        fi
-    done
+    _h="10-healthchecks.sh"
+    if [ ! -e "${_vigia_dir}/hooks.d/${_h}" ] && [ ! -e "${_vigia_dir}/hooks.d/${_h}.ejemplo" ]; then
+        traer_del_repo "hooks/${_h}.ejemplo" "${_vigia_dir}/hooks.d/${_h}.ejemplo"
+    fi
 
     info "Vigía: servicio 'vigia' en $COMPOSE_FILE, ronda cada $(( VIGILAR_CADA / 60 )) min."
     info "  Configura los avisos : ${_vigia_dir}/avisos.conf"
