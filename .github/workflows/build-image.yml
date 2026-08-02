@@ -14,9 +14,13 @@ on:
       # Todo lo que la imagen COPIA dentro. Si un fichero entra en la imagen y
       # no está en esta lista, un cambio suyo se queda en main sin llegar nunca
       # a un runner, y en silencio: no falla nada, simplemente no se despliega.
+      # La lista la comprueba el job `imagen-al-dia` de ci.yml contra los COPY
+      # del Containerfile: no basta con acordarse.
       - Containerfile
       - entrypoint.sh
       - healthcheck.sh
+      - latido.sh
+      - vigilar.sh
       - .github/workflows/build-image.yml
   workflow_dispatch:
   schedule:
