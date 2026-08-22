@@ -773,3 +773,62 @@ jobs:
           sh ./deploy.sh --no-up --skip-validation --token FAKE --repo o/r --no-host-label >/dev/null 2>&1
           grep -q '^RUNNER_HOST_LABEL=' .env && { echo "FALLO: --no-host-label no la quitó"; exit 1; }
           echo "ok: etiqueta de host aditiva y desactivable"
+
+  # deploy.ps1 no lo tocaba ninguna prueba, y se notó: la función que baja los
+  # hooks del vigía (`Get-DelRepo`) desapareció al containerizar el vigía y su
+  # llamada se quedó. En Windows eso no rompía el despliegue —el script corre con
+  # ErrorActionPreference 'Continue'—: dejaba `.\vigia\hooks.d` vacío y el fleet
+  # sin avisos, que es el fallo que no se ve. Estas dos comprobaciones son
+  # baratas (pwsh viene en el runner) y cierran esa clase entera.
+  deploy-ps1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Sintaxis, y ninguna función llamada que no exista
+        shell: pwsh
+        run: |
+          $tokens = $null; $errores = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                   (Resolve-Path ./deploy.ps1).Path, [ref]$tokens, [ref]$errores)
+          if ($errores) {
+              $errores | ForEach-Object { Write-Output "FALLO (sintaxis): $($_.Extent.StartLineNumber): $($_.Message)" }
+              exit 1
+          }
+          $definidas = $ast.FindAll({ param($n)
+              $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true).Name
+          $llamadas = $ast.FindAll({ param($n)
+              $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+              ForEach-Object { $_.GetCommandName() } | Where-Object { $_ }
+          # Solo nombres con forma Verbo-Nombre: los comandos nativos del sistema
+          # (podman, docker, icacls) no se pueden resolver en Linux y darían falsos
+          # positivos. Un helper interno del script siempre tiene esta forma.
+          $faltan = $llamadas | Sort-Object -Unique | Where-Object {
+              $_ -match '^[A-Z][a-zA-Z]*-[A-Za-z]+$' -and
+              $definidas -notcontains $_ -and
+              -not (Get-Command $_ -ErrorAction SilentlyContinue)
+          }
+          if ($faltan) {
+              Write-Output "FALLO: deploy.ps1 llama a funciones que no existen:"
+              $faltan | ForEach-Object { Write-Output "  - $_" }
+              exit 1
+          }
+          Write-Output "ok: deploy.ps1 parsea y no llama a nada inexistente"
+
+      # deploy.sh y deploy.ps1 emiten el MISMO servicio `vigia`, y el vigía lee
+      # su identidad de esas variables. Si una falta en un lado, ese sistema
+      # operativo se queda con un vigía mal identificado (VIGIA_HOST ya faltaba en
+      # Windows: sin él, el nombre del check sale del ID del contenedor y cambia
+      # en cada recreate, así que cada arranque estrena check y el anterior queda
+      # huérfano y en rojo).
+      - name: Los dos deploy emiten las mismas variables del vigía
+        run: |
+          set -eu
+          sh_keys="$(grep -oE 'VIGIA_[A-Z_]+' deploy.sh  | sort -u)"
+          ps_keys="$(grep -oE 'VIGIA_[A-Z_]+' deploy.ps1 | sort -u)"
+          if [ "$sh_keys" != "$ps_keys" ]; then
+            echo "FALLO: deploy.sh y deploy.ps1 no emiten las mismas VIGIA_*:"
+            diff -u <(printf '%s\n' "$sh_keys") <(printf '%s\n' "$ps_keys") || true
+            exit 1
+          fi
+          echo "ok: paridad de variables del vigía entre deploy.sh y deploy.ps1"
