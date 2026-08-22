@@ -115,7 +115,8 @@ Vigilancia (opt-in):
   -Vigilar               Instala el vigía: comprueba los runners cada pocos minutos
                          y entrega un informe a tus hooks. Detecta el runner
                          ATASCADO (sigue "Up" pero no toma jobs), el contenedor
-                         ausente y el reloj desfasado. Requiere Git Bash (sh.exe).
+                         ausente y el reloj desfasado. Corre como contenedor del
+                         compose: no necesita Git Bash ni tarea programada.
   -VigilarCada N         Cadencia de la ronda (por defecto 300; acepta 5min, 1h)
   -VigilarMinimo N       Runners sanos por debajo de los cuales el estado pasa de
                          'parcial' (se registra) a 'degradado' (alarma)
@@ -342,6 +343,30 @@ function Protect-File($path) {
     }
     catch { Info "AVISO: no se pudieron restringir los permisos de ${path}." }
 }
+# Trae un fichero del repo: del clon si `deploy.ps1` corre desde uno, y si no del
+# raw de GitHub. La llamada (los hooks del vigía) sobrevivió al commit que
+# containerizó el vigía y esta función no: en Windows, `-Vigilar` moría aquí con
+# "Get-DelRepo no se reconoce" y —como el script corre con ErrorActionPreference
+# 'Continue'— seguía adelante dejando `.\vigia\hooks.d` VACÍO. Sin hooks el vigía
+# no avisa de nada, y eso es indistinguible de un fleet sano.
+function Get-DelRepo($rel, $dest) {
+    if ($PSScriptRoot) {
+        $local = Join-Path $PSScriptRoot $rel
+        # Si el despliegue ES el propio clon, origen y destino son el mismo
+        # fichero: no hay nada que copiar (paridad con deploy.sh).
+        if ((Test-Path -LiteralPath $local) -and ($local -ne $dest)) {
+            Copy-Item -LiteralPath $local -Destination $dest -Force
+            return
+        }
+        if ($local -eq $dest) { return }
+    }
+    try {
+        Invoke-WebRequest -Uri "$RawBase/$rel" -OutFile $dest -UseBasicParsing -ErrorAction Stop
+    }
+    catch {
+        Die "no pude obtener $rel (ni junto al script ni desde $RawBase). Clona el repo y ejecuta deploy.ps1 desde ahí."
+    }
+}
 function Test-Ours($path) {
     if (-not (Test-Path -LiteralPath $path)) { return $true }
     $first = Get-Content -LiteralPath $path -TotalCount 1 -ErrorAction SilentlyContinue
@@ -457,6 +482,12 @@ if ($Vigilar) {
     $c += "    command: [`"--bucle`"]`n"
     $c += "    environment:`n"
     $c += "      VIGIA_CLUSTER: `"{0}`"`n" -f $cluster
+    # El host se PASA, no se deduce: dentro del contenedor `hostname` devuelve el
+    # ID del contenedor, que ademas cambia en cada recreate. Ese valor forma parte
+    # del nombre del check, asi que deducirlo daria un check nuevo cada vez que se
+    # recrea el vigia. Faltaba aqui (si estaba en deploy.sh), y sin el
+    # `configurar-avisos.ps1` no puede saber a que check pertenece esta maquina.
+    $c += "      VIGIA_HOST: `"{0}`"`n" -f $hostShort
     $c += "      VIGIA_RUNNERS: `"{0}`"`n" -f ($nombres -join ' ')
     $c += "      VIGIA_CADA: `"{0}`"`n" -f $vigilarCadaSeg
     $c += "      VIGIA_MINIMO: `"{0}`"`n" -f $VigilarMinimo
