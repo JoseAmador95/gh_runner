@@ -40,7 +40,11 @@ MARCA_CONFIG="${LATIDO_MARCA_CONFIG:-/home/runner/.runner}"
 # El nombre del fichero es el que ve GitHub: es el que aparece en Settings ->
 # Runners y el que reconoce quien lee el aviso. Se sanea porque acaba siendo un
 # nombre de fichero.
-NOMBRE="$(printf '%s' "${RUNNER_NAME:-runner}" | tr -c 'A-Za-z0-9_.-' '-')"
+# `LC_ALL=C` igual que en el `sanear()` del vigía, que compone este mismo nombre
+# para ir a buscar el fichero: el `tr` de BSD (macOS) bajo un locale UTF-8 razona
+# por caracteres y el de Linux por bytes, así que un nombre con acento daría dos
+# ficheros distintos y el vigía daría por caído a un runner que late.
+NOMBRE="$(printf '%s' "${RUNNER_NAME:-runner}" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '-')"
 
 # ¿Hay un job corriendo? Sustituye al `podman top | grep Runner.Worker` que hacía
 # el vigía desde el host. Se lee /proc directamente en vez de usar pgrep porque
@@ -48,9 +52,30 @@ NOMBRE="$(printf '%s' "${RUNNER_NAME:-runner}" | tr -c 'A-Za-z0-9_.-' '-')"
 # por esto.
 # PROC es configurable SOLO para poder probar los dos casos: el test corre dentro
 # de un runner de GitHub, que tiene su propio proceso Runner.Worker, así que "no
-# hay ningún job" no se puede reproducir mirando el /proc de verdad.
+# hay ningún job" no se puede reproducir mirando el /proc de verdad. Y de paso es
+# lo que permite probar la rama de macOS desde un CI de Linux: apuntándolo a una
+# ruta que no existe.
 PROC="${LATIDO_PROC:-/proc}"
 ocupado() {
+    # Sin /proc (macOS no lo tiene) hay que preguntárselo a `ps`. El glob de abajo
+    # no falla ahí: se queda LITERAL, `tr` no encuentra el fichero y la función
+    # devuelve siempre 1: todos los jobs saldrían como `libre` para siempre, y en
+    # silencio. Envenena justo el campo «último job», que se quedaría en '-'
+    # eternamente con los jobs corriendo — y ese campo existe para delatar al
+    # runner mal etiquetado al que nadie manda trabajo. `-o comm=` da solo el
+    # ejecutable, que es la misma regla de argv[0] del caso Linux.
+    if [ ! -d "$PROC" ]; then
+        # El here-doc, y no una tubería: `while ... | read` corre en una subshell
+        # y el `return 0` no saldría de esta función, sino de ella.
+        while IFS= read -r _p; do
+            case "$_p" in
+                */Runner.Worker|Runner.Worker) return 0 ;;
+            esac
+        done <<EOF
+$(ps -Ao comm= 2>/dev/null)
+EOF
+        return 1
+    fi
     for _c in "$PROC"/[0-9]*/cmdline; do
         # Solo argv[0] (el ejecutable), no la línea entera: buscando en toda la
         # línea, cualquier proceso que MENCIONE la cadena —un script, el propio

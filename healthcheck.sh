@@ -42,11 +42,23 @@ log="$(ls -1t "$DIAG"/Runner_*.log 2>/dev/null | head -n1)"
 # durar minutos). Sano: --start-period cubre este hueco.
 [ -n "$log" ] || exit 0
 
+# Restar minutos a la hora actual se escribe distinto en GNU y en BSD, y ninguno
+# de los dos entiende la forma del otro. Se prueban las dos, mismo patrón que
+# `a_epoch` en vigilar.sh. El `date` del contenedor es GNU, pero este script
+# también corre en el runner de macOS, donde solo existe la forma BSD.
+corte_ventana() {
+    date -u -d "-${VENTANA_MIN} minutes" '+%Y-%m-%d %H:%M:%S' 2>/dev/null && return 0   # GNU
+    date -u -v-"${VENTANA_MIN}"M         '+%Y-%m-%d %H:%M:%S' 2>/dev/null && return 0   # BSD/macOS
+    return 1
+}
+
 # Corte de la ventana en el MISMO formato que el prefijo del log
 # ("[2026-08-01 11:16:01Z INFO Listener] ..."), para poder comparar como texto:
-# el formato ISO ordena lexicográficamente. Si `date -d` no existe, se compara
-# sin ventana (peor: más sensible; nunca menos).
-corte="$(date -u -d "-${VENTANA_MIN} minutes" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '')"
+# el formato ISO ordena lexicográficamente. Sin ningún `date` compatible se
+# compara sin ventana (peor: más sensible; nunca menos) — que es un mal negocio
+# en una VM efímera, donde un error del arranque dejaría el runner marcado
+# `atascado` durante todo el job aunque llevara media hora tomando trabajo.
+corte="$(corte_ventana || printf '')"
 
 motivo="$(
     tail -n 500 "$log" 2>/dev/null | awk -v corte="$corte" '

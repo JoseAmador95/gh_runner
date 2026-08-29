@@ -78,6 +78,18 @@ DESFASE_MAX="${VIGIA_DESFASE_MAX:-60}"
 # reaccionar: a partir de ahí una cache o un checkout grande ya puede no caber.
 DISCO_MAX="${VIGIA_DISCO_MAX:-90}"
 
+# Ruta cuyo disco mide el VIGÍA por su cuenta, además de lo que reporten los
+# runners. Vacía = solo lo reportado, que es lo de siempre.
+#
+# Existe porque el latido mide el disco DESDE DENTRO del runner, y hay un caso en
+# que ese no es el disco que se llena: con runners en VM efímera (macOS + Tart),
+# el invitado se destruye tras cada job —su ocupación no llega nunca al umbral—
+# mientras las imágenes en ~/.tart se comen el disco del host a decenas de GB por
+# VM. Nadie lo reportaría y la primera señal sería un job fallando por «no space
+# left» que no señala la causa. En Linux vale igual para apuntar al volumen de
+# caches, que tampoco vive dentro del contenedor.
+DISCO_RUTA="${VIGIA_DISCO_RUTA:-}"
+
 SOLO_INFORME="no"
 BUCLE="no"
 
@@ -93,6 +105,7 @@ while [ "$#" -gt 0 ]; do
         --cada)         CADA="${2:?falta el valor tras --cada}"; shift 2 ;;
         --desfase-max)  DESFASE_MAX="${2:?falta el valor tras --desfase-max}"; shift 2 ;;
         --disco-max)    DISCO_MAX="${2:?falta el valor tras --disco-max}"; shift 2 ;;
+        --disco-ruta)   DISCO_RUTA="${2:?falta la ruta tras --disco-ruta}"; shift 2 ;;
         --informe)      SOLO_INFORME="yes"; shift ;;
         --bucle)        BUCLE="yes"; shift ;;
         -h|--help)
@@ -118,7 +131,12 @@ fi
 # El mismo saneado que aplica latido.sh al componer el nombre del fichero: si no
 # coincidiera, el vigía buscaría un fichero que nadie escribe y daría por caído a
 # un runner sano.
-sanear() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-'; }
+# `LC_ALL=C` no es adorno, y por eso va aquí igual que en `col()`: el `tr` de BSD
+# (macOS) bajo un locale UTF-8 razona por CARACTERES, así que un nombre con
+# acento se convierte en un número de guiones distinto al que produce el `tr` del
+# contenedor Linux que escribe el latido. El vigía buscaría entonces un fichero
+# que nadie escribe y daría por caído a un runner sano.
+sanear() { printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '-'; }
 
 # Rellena $1 hasta $2 CARACTERES. No se usa `printf '%-*s'` porque cuenta BYTES:
 # con «caído» o «sin señal» (multibyte en UTF-8) la columna sale corta y la tabla
@@ -171,6 +189,44 @@ medir_desfase() {
     [ -n "$_fecha_gh" ] || return 0
     _epoch_gh="$(a_epoch "$_fecha_gh")" || return 0
     DESFASE=$(( $(date -u +%s) - _epoch_gh ))
+}
+
+# `timeout` de repuesto, en shell puro: corre "$@" y lo mata si pasa de $1
+# segundos. Devuelve el código del hook, o 143 (SIGTERM) si hubo que matarlo, que
+# es lo mismo que devuelve `timeout` y basta para que la ronda lo nombre.
+#
+# El `exec 3<&0` + `<&3` NO es equivalente a dejarlo tal cual: en un shell POSIX
+# sin control de trabajos (dash, el /bin/sh del contenedor), un proceso lanzado en
+# segundo plano recibe /dev/null como entrada salvo redirección EXPLÍCITA. Medido:
+# sin esto el hook arranca, no falla y manda un aviso VACÍO — el informe se pierde
+# por el camino. `<&0` tampoco vale: la asignación a /dev/null ya ocurrió.
+con_limite() {
+    _lim="$1"; shift
+    exec 3<&0
+    "$@" <&3 &
+    _hijo=$!
+    # El vigilante duerme de segundo en segundo en vez de `sleep $_lim` de una vez
+    # para poder rendirse en cuanto el hook termina: si no, cada ronda arrastraría
+    # el límite entero aunque todos los hooks contesten al instante.
+    (
+        _t=0
+        while [ "$_t" -lt "$_lim" ]; do
+            kill -0 "$_hijo" 2>/dev/null || exit 0
+            sleep 1
+            _t=$(( _t + 1 ))
+        done
+        # TERM primero y KILL después: a un hook colgado en una petición HTTP se
+        # le da ocasión de cerrar, pero no derecho a ignorarnos.
+        kill -TERM "$_hijo" 2>/dev/null || true
+        sleep 2
+        kill -KILL "$_hijo" 2>/dev/null || true
+    ) &
+    _vigilante=$!
+    _rc=0
+    wait "$_hijo" || _rc=$?
+    kill "$_vigilante" 2>/dev/null || true
+    wait "$_vigilante" 2>/dev/null || true
+    return "$_rc"
 }
 
 # ---- Una ronda -------------------------------------------------------------
@@ -262,6 +318,20 @@ ronda() {
     done
 
     CAIDOS="${CAIDOS# }"
+
+    # El disco que el vigía mide por su cuenta (ver DISCO_RUTA). Se queda el PEOR
+    # de los dos, no el suyo: si un runner reporta más ocupación que el host, ese
+    # es el que va a reventar, y quedarse con el último medido lo taparía.
+    # `df -P` fuerza el formato POSIX en una línea, igual que en latido.sh: sin
+    # -P, un punto de montaje largo se parte en dos y el porcentaje cae en otra
+    # columna.
+    if [ -n "$DISCO_RUTA" ]; then
+        _dh="$(df -P "$DISCO_RUTA" 2>/dev/null | awk 'NR==2 { gsub(/%/, "", $5); print $5 }')"
+        case "$_dh" in ''|*[!0-9]*) _dh="" ;; esac
+        if [ -n "$_dh" ] && [ "$_dh" -gt "${DISCO_PICO:-0}" ]; then
+            DISCO_PICO="$_dh"
+        fi
+    fi
 
     # Latidos huérfanos: al bajar de 5 runners a 3, los dos ficheros que sobran
     # no deben alarmar ni ensuciar. Manda el censo.
@@ -383,9 +453,16 @@ ronda() {
     fi
 
     # `timeout` evita que un hook colgado (una API que no responde) atasque la
-    # ronda siguiente. Si no está disponible, se corre sin él.
-    TIMEOUT=""
-    command -v timeout >/dev/null 2>&1 && TIMEOUT="timeout 15"
+    # ronda siguiente. Nunca se corre sin límite: en macOS no hay `timeout` en el
+    # sistema base —la elegancia del `command -v` dejaba el guard cumplido y los
+    # hooks sueltos—, así que se busca también el `gtimeout` de coreutils y, sin
+    # ninguno de los dos, lo impone `con_limite`.
+    TIMEOUT="con_limite 15"
+    if command -v timeout >/dev/null 2>&1; then
+        TIMEOUT="timeout 15"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        TIMEOUT="gtimeout 15"
+    fi
 
     # Orden lexicográfico: el prefijo numérico decide quién habla primero. El
     # latido va con 10- a propósito, para que un hook roto más abajo no retrase la

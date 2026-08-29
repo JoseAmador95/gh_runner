@@ -649,6 +649,186 @@ jobs:
             || { echo "FALLO: perdió la marca del último job al quedar libre"; exit 1; }
           echo "ok: disco medido, ocupado/libre determinista y la marca sobrevive"
 
+      # `timeout` no existe en el sistema base de macOS, y el guard de una línea
+      # que lo buscaba se cumplía con elegancia: los hooks pasaban a correr SIN
+      # LÍMITE. Un hook colgado en una API que no contesta atascaba entonces la
+      # ronda siguiente indefinidamente y en silencio — justo lo que ese límite
+      # existe para evitar. Aquí se le quitan `timeout` y `gtimeout` del PATH para
+      # recorrer el camino que se toma en un Mac.
+      - name: Un hook colgado no atasca la ronda aunque no haya `timeout`
+        timeout-minutes: 3
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/lim"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/hooks" "$d/bin"
+          printf '%s sano libre 30 %s \n' "$(date -u +%s)" "$(date -u +%s)" > "$d/latidos/a"
+          printf '#!/bin/sh\nsleep 300\n' > "$d/hooks/10-colgado"
+          printf '#!/bin/sh\ncat >> %s/log\n' "$d" > "$d/hooks/20-despues"
+          chmod +x "$d/hooks/10-colgado" "$d/hooks/20-despues"
+
+          # PATH sin los dos: un enlace por herramienta del sistema MENOS esas.
+          # Poner un `timeout` falso que no limitara no serviría: `command -v` lo
+          # encontraría y el guard seguiría creyendo que hay límite.
+          for p in /usr/bin/* /bin/*; do
+            b="${p##*/}"
+            case "$b" in timeout|gtimeout) continue ;; esac
+            ln -sf "$p" "$d/bin/$b" 2>/dev/null || true
+          done
+          export PATH="$d/bin"
+          command -v timeout  >/dev/null 2>&1 && { echo "FALLO: el PATH de prueba aún tiene timeout"; exit 1; }
+          command -v gtimeout >/dev/null 2>&1 && { echo "FALLO: el PATH de prueba aún tiene gtimeout"; exit 1; }
+
+          ini="$(date -u +%s)"
+          env VIGIA_LATIDOS="$d/latidos" VIGIA_HOOKS="$d/hooks" VIGIA_ESTADO_FILE="$d/e" \
+              VIGIA_RUNNERS=a VIGIA_CLUSTER=ci VIGIA_HOST=mac VIGIA_DESFASE_MAX=999999 \
+              sh "$GITHUB_WORKSPACE/vigilar.sh" >/dev/null 2>&1
+          fin="$(date -u +%s)"
+
+          [ "$(( fin - ini ))" -lt 60 ] \
+            || { echo "FALLO: la ronda tardó $(( fin - ini ))s; el hook corrió sin límite"; exit 1; }
+          # Y el límite de repuesto tiene que pasarle el informe por stdin: en un
+          # shell POSIX un proceso en segundo plano recibe /dev/null como entrada
+          # salvo redirección explícita, así que sin ella el hook manda un aviso
+          # VACÍO — arranca, no falla y no dice nada.
+          grep -q 'Fleet ci' "$d/log" \
+            || { echo "FALLO: el hook siguiente no recibió el informe"; cat "$d/log" 2>/dev/null; exit 1; }
+          echo "ok: el hook colgado se corta y el siguiente recibe el informe entero"
+
+      # macOS no tiene /proc: el glob `"$PROC"/[0-9]*/cmdline` se queda LITERAL y
+      # la detección devolvía siempre «libre». Es el peor tipo de fallo, el
+      # callado: el campo «último job» —el que delata al runner mal etiquetado al
+      # que nadie manda trabajo— se quedaría en '-' para siempre con los jobs
+      # corriendo.
+      - name: latido.sh detecta el job con `ps` cuando no hay /proc
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/sinproc"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/con" "$d/sin"
+          printf '#!/bin/sh\nexit 0\n' > "$d/ok"; chmod +x "$d/ok"; touch "$d/cfg"
+
+          # `ps` de mentira. El de verdad no vale: este job corre DENTRO de un
+          # runner de GitHub, que tiene su propio Runner.Worker, así que "no hay
+          # ningún job" es irreproducible con el `ps` real.
+          printf '#!/bin/sh\nprintf "launchd\\n/Users/ci/actions-runner/bin/Runner.Worker\\nsshd\\n"\n' > "$d/con/ps"
+          printf '#!/bin/sh\nprintf "launchd\\nsshd\\n/usr/bin/Runner.Worker.log\\n"\n' > "$d/sin/ps"
+          chmod +x "$d/con/ps" "$d/sin/ps"
+
+          # LATIDO_PROC a una ruta que no existe: es el gancho que permite recorrer
+          # la rama de macOS desde este runner de Linux.
+          lat() {  # $1 = directorio con el `ps` falso
+            PATH="$1:$PATH" LATIDO_DIR="$d/latidos" LATIDO_CADA=1 LATIDO_HEALTHCHECK="$d/ok" \
+            LATIDO_MARCA_CONFIG="$d/cfg" LATIDO_TRABAJO="$d" LATIDO_PROC="$d/no-existe" \
+            RUNNER_NAME=r timeout 2 sh ./latido.sh 2>/dev/null || true
+          }
+
+          lat "$d/con"
+          [ "$(awk '{print $3}' "$d/latidos/r")" = "ocupado" ] \
+            || { echo "FALLO: sin /proc no vio el job en curso"; cat "$d/latidos/r"; exit 1; }
+          [ "$(awk '{print $5}' "$d/latidos/r")" != "-" ] \
+            || { echo "FALLO: sin /proc no registró la marca del último job"; exit 1; }
+
+          lat "$d/sin"
+          [ "$(awk '{print $3}' "$d/latidos/r")" = "libre" ] \
+            || { echo "FALLO: 'Runner.Worker.log' no es un job; solo cuenta argv[0] exacto"; exit 1; }
+          echo "ok: sin /proc manda ps, con la misma regla de argv[0]"
+
+      # `date -u -d` es de GNU y en una VM de macOS no existe. El código degradaba
+      # a «sin ventana» —más sensible, nunca menos—, que suena inofensivo y no lo
+      # es en una VM efímera: un error transitorio del arranque dejaría el runner
+      # marcado `atascado` el resto del job, con los jobs corriendo.
+      - name: healthcheck.sh acota la ventana también con el `date` de BSD
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/bsd"; rm -rf "$d"; mkdir -p "$d/_diag" "$d/bin"
+          ahora="$(date -u '+%Y-%m-%d %H:%M:%S')"
+          viejo="$(date -u -d '-30 minutes' '+%Y-%m-%d %H:%M:%S')"
+
+          cat > "$d/bin/date" <<'STUB'
+          #!/bin/sh
+          # `date` como el de BSD/macOS: rechaza -d y entiende -v-<N>M.
+          utc=""; fmt=""; resta=""
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              -u)    utc="-u" ;;
+              -d)    echo "date: illegal option -- d" >&2; exit 1 ;;
+              -v-*M) resta="-${1#-v-}"; resta="${resta%M} minutes" ;;
+              +*)    fmt="$1" ;;
+            esac
+            shift
+          done
+          # La resta ya traducida se delega al `date` real, que aquí es GNU.
+          [ -n "$resta" ] && exec /usr/bin/date $utc -d "$resta" "$fmt"
+          exec /usr/bin/date $utc "$fmt"
+          STUB
+          chmod +x "$d/bin/date"
+
+          PATH="$d/bin:$PATH" date -u -d '-5 minutes' >/dev/null 2>&1 \
+            && { echo "FALLO: el date de prueba acepta -d, así que no prueba nada"; exit 1; }
+
+          hc() {  # -> código de salida de healthcheck.sh con el date de BSD
+            rc=0
+            PATH="$d/bin:$PATH" RUNNER_DIAG_DIR="$d/_diag" ./healthcheck.sh >/dev/null 2>&1 || rc=$?
+            printf '%s' "$rc"
+          }
+
+          # Error fuera de la ventana y sin señal de recuperación: es EL caso que
+          # separa las dos ramas. Sin ventana sale `atascado`; con ventana, sano.
+          printf '[%sZ ERR  Listener] Retrying until reconnected.\n' "$viejo" > "$d/_diag/Runner_x.log"
+          [ "$(hc)" = 0 ] \
+            || { echo "FALLO: sin la forma BSD de restar minutos se perdió la ventana"; exit 1; }
+
+          # Y la ventana sigue siendo una ventana, no un mutis: lo reciente avisa.
+          printf '[%sZ ERR  Listener] Retrying until reconnected.\n' "$ahora" > "$d/_diag/Runner_x.log"
+          [ "$(hc)" = 1 ] \
+            || { echo "FALLO: el error reciente debería seguir dando atascado"; exit 1; }
+          echo "ok: la ventana se acota igual con el date de BSD"
+
+      # El disco lo mide cada runner DESDE DENTRO, y hay un caso en que ese no es
+      # el disco que se llena: con runners en VM efímera el invitado se destruye
+      # tras cada job —su ocupación nunca llega al umbral— mientras las imágenes
+      # del host crecen a decenas de GB por VM. Nadie lo reportaría y la primera
+      # señal sería un job fallando por «no space left».
+      - name: VIGIA_DISCO_RUTA mide el disco del host y se queda con el peor
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/dr"; rm -rf "$d"; mkdir -p "$d/latidos" "$d/hooks" "$d/bin"
+          now="$(date -u +%s)"
+
+          # `df` de mentira: la ruta vigilada va al 97%.
+          cat > "$d/bin/df" <<'STUB'
+          #!/bin/sh
+          printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+          printf '/dev/disco 100 97 3 97%% /\n'
+          STUB
+          chmod +x "$d/bin/df"
+
+          informe() {  # $1 = ruta que mide el vigía (vacía = como hasta hoy)
+            rm -f "$d/e"
+            PATH="$d/bin:$PATH" env VIGIA_LATIDOS="$d/latidos" VIGIA_HOOKS="$d/hooks" \
+              VIGIA_ESTADO_FILE="$d/e" VIGIA_RUNNERS=a VIGIA_CLUSTER=ci VIGIA_HOST=mac \
+              VIGIA_DESFASE_MAX=999999 VIGIA_DISCO_RUTA="$1" \
+              sh "$GITHUB_WORKSPACE/vigilar.sh" --informe
+          }
+
+          printf '%s sano libre 40 %s \n' "$now" "$now" > "$d/latidos/a"
+          # Sin la variable no se mide nada, aunque el `df` diga 97%: el informe
+          # tiene que salir idéntico al de hoy.
+          informe '' | grep -q 'Disco: 40%' \
+            || { echo "FALLO: sin VIGIA_DISCO_RUTA el vigía no debe medir por su cuenta"; informe ''; exit 1; }
+          informe '' | grep -q 'DISCO AL' \
+            && { echo "FALLO: sin la variable no puede aparecer el aviso de disco"; exit 1; }
+
+          informe "$d" | grep -q 'Disco: 97%' \
+            || { echo "FALLO: no midió la ruta que le pasaron"; informe "$d"; exit 1; }
+          informe "$d" | grep -q 'DISCO AL 97%' \
+            || { echo "FALLO: el disco del host no dispara el aviso"; exit 1; }
+
+          # Y al revés: se queda el PEOR de los dos. Si un runner reporta más que
+          # el host, ese es el que va a reventar y quedarse con el último medido
+          # lo taparía.
+          printf '%s sano libre 99 %s \n' "$now" "$now" > "$d/latidos/a"
+          informe "$d" | grep -q 'Disco: 99%' \
+            || { echo "FALLO: medir el host tapó lo que reportó el runner"; informe "$d"; exit 1; }
+          echo "ok: VIGIA_DISCO_RUTA añade la medición del host sin tapar la del runner"
+
   smoke:
     runs-on: ubuntu-latest
     steps:
