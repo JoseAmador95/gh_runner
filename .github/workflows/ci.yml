@@ -1372,6 +1372,338 @@ jobs:
           [ "$campos" -ge 5 ] || { echo "FALLO: la línea de latido no sigue el formato de latido.sh"; cat "$lat"; exit 1; }
           echo "ok: el hueco sin VM queda cubierto por el latido del supervisor"
 
+  # deploy-macos.sh genera lo que launchd lee, y launchd no perdona: un plist mal
+  # formado no da "XML inválido", da "Bootstrap failed: 5: Input/output error" y el
+  # fleet no arranca. Lo mismo con ExitTimeOut: si es corto, launchd manda SIGKILL a
+  # mitad de la parada elegante y deja justo lo que `recoger_huerfanas` tiene que
+  # barrer (una VM de decenas de GB viva y un runner fantasma en Settings). Nada de
+  # eso se ve leyendo el script, así que se comprueba parseando el plist con
+  # plistlib — el análogo exacto de validar el compose con PyYAML en el job `smoke`.
+  deploy-macos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Stubs de tart, launchctl, sw_vers, brew y podman en el PATH
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/bin"; mkdir -p "$d"
+
+          # Aquí no hay ni Tart ni launchd: este job comprueba lo que se ESCRIBE,
+          # no lo que pasa al levantarlo. Los stubs solo evitan que el script se
+          # desvíe por "no encuentro el binario".
+          cat > "$d/tart" <<'STUB'
+          #!/bin/sh
+          [ "$1" = list ] && { echo "Source Name Disk Size State"; exit 0; }
+          exit 0
+          STUB
+          cat > "$d/launchctl" <<'STUB'
+          #!/bin/sh
+          exit 0
+          STUB
+          cat > "$d/sw_vers" <<'STUB'
+          #!/bin/sh
+          [ "$1" = "-productVersion" ] && { echo "15.4"; exit 0; }
+          echo "macOS"; exit 0
+          STUB
+          cat > "$d/brew" <<'STUB'
+          #!/bin/sh
+          exit 0
+          STUB
+          # deploy.sh (camino Linux) hace falta en el caso de paridad de nombres.
+          cat > "$d/podman" <<'STUB'
+          #!/bin/sh
+          if [ "$1" = "compose" ] && [ "$2" = "version" ]; then echo "stub"; exit 0; fi
+          exit 0
+          STUB
+          chmod +x "$d"/*
+          echo "$d" >> "$GITHUB_PATH"
+
+      - name: Los plists dicen lo que launchd necesita (y los parsea plistlib)
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/mac-plist/mi-cluster"; rm -rf "$d"; mkdir -p "$d"; cd "$d"
+          sh "$GITHUB_WORKSPACE/deploy-macos.sh" --no-up --skip-validation \
+            --token PAT-SECRETO-abc123 --repo owner/repo --count 2 \
+            --cpus 4 --memory 12G --vigilar >/dev/null 2>&1
+
+          # El de control se GENERA, así que un error de sintaxis suyo no aparecería
+          # hasta que alguien intentara parar el fleet.
+          sh -n macos-ctl.sh || { echo "FALLO: macos-ctl.sh generado no es sh válido"; exit 1; }
+
+          python3 - <<'PY'
+          import glob, os, plistlib, sys
+
+          dep = os.getcwd()
+          fallos = []
+          etiquetas = set()
+
+          for f in sorted(glob.glob("LaunchAgents/*.plist")):
+              with open(f, "rb") as fh:
+                  p = plistlib.load(fh)          # si no es XML válido, revienta aquí
+
+              lab = p.get("Label", "")
+              if lab in etiquetas:
+                  fallos.append(f"{f}: Label repetida ({lab}); launchd solo cargaría uno de los dos")
+              etiquetas.add(lab)
+              if "mi-cluster" not in lab:
+                  fallos.append(f"{f}: la Label no lleva el cluster ({lab}); dos despliegues del mismo Mac chocarían")
+
+              # KeepAlive es el `restart: always`; sin RunAtLoad no arranca al cargar.
+              for k in ("KeepAlive", "RunAtLoad"):
+                  if p.get(k) is not True:
+                      fallos.append(f"{f}: {k} no es true ({p.get(k)!r})")
+
+              # 120 s es lo que tarda la parada elegante del supervisor: pedir el
+              # drenado por ssh (90 s de gracia), tart stop, tart delete y borrar el
+              # runner fantasma por API. Con menos, SIGKILL a mitad.
+              if int(p.get("ExitTimeOut", 0)) < 120:
+                  fallos.append(f"{f}: ExitTimeOut={p.get('ExitTimeOut')} < 120; launchd mataría la parada elegante")
+
+              for k in ("StandardOutPath", "StandardErrorPath"):
+                  ruta = p.get(k, "")
+                  if not ruta.startswith(dep + "/log/"):
+                      fallos.append(f"{f}: {k}={ruta} fuera de {dep}/log")
+
+              args = p.get("ProgramArguments", [])
+              if not args or not os.path.isabs(args[0]):
+                  fallos.append(f"{f}: ProgramArguments[0] no es una ruta absoluta ({args[:1]}); launchd no tiene cwd")
+
+              if ".runner-" in lab:
+                  slot = lab.rsplit("-", 1)[1]
+                  esperado = [f"{dep}/supervisar-macos.sh", "--slot", slot,
+                              "--cpu", "4", "--memoria", "12288"]
+                  if args != esperado:
+                      fallos.append(f"{f}: ProgramArguments {args} != {esperado}")
+                  env = p.get("EnvironmentVariables", {})
+                  # launchd arranca con un PATH mínimo SIN /opt/homebrew/bin: sin
+                  # esto el supervisor muere con "falta 'tart'" aunque esté instalado.
+                  if "/opt/homebrew/bin" not in env.get("PATH", ""):
+                      fallos.append(f"{f}: el PATH del agente no lleva Homebrew ({env.get('PATH')})")
+                  if p.get("WorkingDirectory") != dep:
+                      fallos.append(f"{f}: WorkingDirectory={p.get('WorkingDirectory')}; el supervisor lee ./.env de ahí")
+                  for k, v in (("SUPERVISAR_MONTAJE", f"{dep}/montaje"),
+                               ("SUPERVISAR_LATIDOS", f"{dep}/latidos"),
+                               ("SUPERVISAR_ESTADO", f"{dep}/estado"),
+                               ("SUPERVISAR_CLUSTER", "mi-cluster")):
+                      if env.get(k) != v:
+                          fallos.append(f"{f}: {k}={env.get(k)!r} != {v!r}")
+              elif lab.endswith(".vigia"):
+                  if args != [f"{dep}/vigilar.sh", "--bucle"]:
+                      fallos.append(f"{f}: ProgramArguments del vigía {args}")
+
+          if len(etiquetas) != 3:
+              fallos.append(f"esperaba 3 servicios (2 runners + vigía), hay {sorted(etiquetas)}")
+
+          if fallos:
+              print("FALLO en los LaunchAgents:")
+              for x in fallos:
+                  print("  -", x)
+              sys.exit(1)
+          print("ok: %d plists válidos y completos" % len(etiquetas))
+          PY
+
+      # ~/Library/LaunchAgents lo lee cualquier proceso del usuario, y `launchctl
+      # print` enseña el entorno de un servicio cargado. Es la misma regla que
+      # cumple deploy.sh al no pasar el PAT por argv del contenedor.
+      - name: El PAT no aparece en ningún plist ni en macos-ctl.sh
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/mac-plist/mi-cluster"
+          if grep -rl 'PAT-SECRETO-abc123' LaunchAgents macos-ctl.sh 2>/dev/null | grep -q .; then
+            echo "FALLO: el PAT está en un fichero que lee cualquiera:"
+            grep -rl 'PAT-SECRETO-abc123' LaunchAgents macos-ctl.sh
+            exit 1
+          fi
+          # Y sí tiene que estar donde lo leen el supervisor y el invitado, los dos a 0600.
+          for f in .env montaje/access_token; do
+            grep -q 'PAT-SECRETO-abc123' "$f" || { echo "FALLO: el PAT no llegó a $f"; exit 1; }
+            [ "$(stat -c '%a' "$f")" = "600" ] || { echo "FALLO: $f no está a 0600 ($(stat -c '%a' "$f"))"; exit 1; }
+          done
+          echo "ok: el PAT solo vive en .env y montaje/access_token, a 0600"
+
+      # EL TEST DE MÁS VALOR DEL LOTE. El slug de healthchecks.io y el censo que
+      # consume vigilar-runners.mjs salen de estos nombres: si macOS y Linux los
+      # componen distinto, el panel de avisos se parte en dos y nadie lo nota hasta
+      # que un check queda huérfano en rojo. Se comprueba contra deploy.sh, no
+      # contra una constante, y además contra el nombre que compone de verdad
+      # supervisar-macos.sh (que es quien bautiza la VM y el runner).
+      - name: Paridad de nombres con el camino Linux
+        run: |
+          set -eu
+          host="$(hostname 2>/dev/null || echo runner)"
+          host="${host%%.*}"
+          host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9_-' '-')"
+
+          lin="$RUNNER_TEMP/par/linux"; mac="$RUNNER_TEMP/par/macos"
+          rm -rf "$RUNNER_TEMP/par"; mkdir -p "$lin" "$mac"
+
+          ( cd "$lin"; sh "$GITHUB_WORKSPACE/deploy.sh" --no-up --skip-validation \
+              --token F --repo o/r --count 2 --prefix sherman --vigilar >/dev/null 2>&1 )
+          ( cd "$mac"; sh "$GITHUB_WORKSPACE/deploy-macos.sh" --no-up --skip-validation \
+              --token F --repo o/r --count 2 --prefix sherman --vigilar >/dev/null 2>&1 )
+
+          python3 -m pip install --quiet pyyaml
+          LIN="$lin" MAC="$mac" HOST="$host" python3 - <<'PY'
+          import os, plistlib, sys, yaml
+
+          lin, mac, host = os.environ["LIN"], os.environ["MAC"], os.environ["HOST"]
+
+          doc = yaml.safe_load(open(f"{lin}/compose.yaml"))
+          svcs, vig = doc["services"], doc["services"]["vigia"]["environment"]
+          nombres_linux = [svcs[f"runner-{i}"]["environment"]["RUNNER_NAME"] for i in (1, 2)]
+          check_linux = f"{vig['VIGIA_CLUSTER']}-{vig['VIGIA_HOST']}"
+
+          p = plistlib.load(open(f"{mac}/LaunchAgents/com.gh-runner.sherman.vigia.plist", "rb"))
+          e = p["EnvironmentVariables"]
+          nombres_macos = e["VIGIA_RUNNERS"].split()
+          check_macos = f"{e['VIGIA_CLUSTER']}-{e['VIGIA_HOST']}"
+
+          esperados = [f"sherman-{host}-1", f"sherman-{host}-2"]
+          errores = []
+          if nombres_linux != esperados:
+              errores.append(f"linux: {nombres_linux} != {esperados}")
+          if nombres_macos != esperados:
+              errores.append(f"macos: {nombres_macos} != {esperados}")
+          if check_linux != f"sherman-{host}" or check_macos != f"sherman-{host}":
+              errores.append(f"check: linux={check_linux} macos={check_macos} != sherman-{host}")
+          if errores:
+              print("FALLO: los dos caminos no nombran igual al mismo fleet:")
+              for x in errores:
+                  print("  -", x)
+              sys.exit(1)
+          print("ok: runners", nombres_macos, "· check", check_macos, "en los dos caminos")
+          PY
+
+          # La otra mitad: el censo del plist tiene que coincidir con el nombre que
+          # supervisar-macos.sh compone al arrancar (VM == runner == fichero de
+          # latido). Si divergen, el vigía espera a un runner que no existe y da por
+          # caído a uno que late.
+          cd "$mac"
+          vm="$(env SUPERVISAR_MONTAJE="$mac/montaje" SUPERVISAR_LATIDOS="$mac/latidos" \
+                    SUPERVISAR_ESTADO="$mac/estado" SUPERVISAR_CLUSTER=sherman \
+                    sh ./supervisar-macos.sh --slot 1 --ciclos 1 --limite-job 0 2>&1 \
+                | sed -n "s/.*VM y runner '\([^']*\)'.*/\1/p" | head -n1)"
+          [ "$vm" = "sherman-${host}-1" ] \
+            || { echo "FALLO: el supervisor bautiza la VM '$vm', el censo espera 'sherman-${host}-1'"; exit 1; }
+          echo "ok: el supervisor y el censo del vigía usan el mismo nombre ($vm)"
+
+      # No es un aviso a propósito: un aviso se ignora y el fallo sale de
+      # madrugada (la tercera VM no arranca y KeepAlive la reintenta en bucle).
+      - name: --count 3 aborta citando la EULA de Apple
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/tres"; rm -rf "$d"; mkdir -p "$d"; cd "$d"
+          if sh "$GITHUB_WORKSPACE/deploy-macos.sh" --no-up --skip-validation \
+               --token F --repo o/r --count 3 > salida.log 2>&1; then
+            echo "FALLO: --count 3 salió en verde"; cat salida.log; exit 1
+          fi
+          grep -qi 'EULA' salida.log \
+            || { echo "FALLO: aborta pero no dice que el tope es de licencia"; cat salida.log; exit 1; }
+          [ -e .env ] && { echo "FALLO: abortó DESPUÉS de escribir el despliegue"; exit 1; }
+          echo "ok: --count 3 en rojo, citando la EULA, y sin dejar nada escrito"
+
+      - name: --engine sale en rojo explicando que aquí el motor es Tart
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/eng"; rm -rf "$d"; mkdir -p "$d"; cd "$d"
+          if sh "$GITHUB_WORKSPACE/deploy-macos.sh" --no-up --skip-validation \
+               --token F --repo o/r --engine podman > salida.log 2>&1; then
+            echo "FALLO: --engine podman se aceptó en silencio"; cat salida.log; exit 1
+          fi
+          grep -qi 'tart' salida.log \
+            || { echo "FALLO: rechaza --engine pero no dice cuál es el motor aquí"; cat salida.log; exit 1; }
+          echo "ok: --engine rechazado con explicación"
+
+      # Un plist es XML y aquí se interpolan valores libres (prefijo, etiquetas,
+      # rutas). Un solo '&' sin escapar deja el fichero mal formado y launchd se
+      # niega a cargar el servicio sin decir por qué.
+      - name: Una etiqueta con & o < no rompe el plist
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/xml"; rm -rf "$d"; mkdir -p "$d"; cd "$d"
+          sh "$GITHUB_WORKSPACE/deploy-macos.sh" --no-up --skip-validation \
+            --token F --repo o/r --count 1 --vigilar \
+            --prefix 'a&b<c' --labels 'x&y<z"q' >/dev/null 2>&1
+          python3 - <<'PY'
+          import glob, plistlib, sys
+          ficheros = glob.glob("LaunchAgents/*.plist")
+          assert ficheros, "no se generó ningún plist"
+          for f in ficheros:
+              with open(f, "rb") as fh:
+                  p = plistlib.load(fh)      # sin escapado XML, esto revienta
+              lab = p["Label"]
+              if "a&b<c" not in lab:
+                  print(f"FALLO: {f}: el valor llegó alterado ({lab})"); sys.exit(1)
+          p = plistlib.load(open("LaunchAgents/com.gh-runner.a&b<c.vigia.plist", "rb"))
+          censo = p["EnvironmentVariables"]["VIGIA_RUNNERS"]
+          if not censo.startswith("a&b<c-"):
+              print(f"FALLO: censo alterado ({censo})"); sys.exit(1)
+          print("ok: %d plists con '&' y '<' siguen parseando" % len(ficheros))
+          PY
+          # Las etiquetas van al .env, no al plist, y tienen que llegar verbatim:
+          # el invitado se las pasa tal cual a config.sh.
+          grep -qx 'RUNNER_LABELS=x&y<z"q' .env \
+            || { echo "FALLO: --labels no llegó intacta al .env"; grep RUNNER_LABELS .env; exit 1; }
+
+      # configurar-avisos.sh de los repos consumidores copia UN fichero a
+      # ./vigia/avisos.conf y los hooks a ./vigia/hooks.d. Si macOS dejara esa
+      # carpeta con otra forma, ese script seguiría saliendo en verde y el fleet
+      # se quedaría sin avisos, en silencio.
+      - name: ./vigia queda con la misma forma que en el camino Linux
+        run: |
+          set -eu
+          lin="$RUNNER_TEMP/par/linux"; mac="$RUNNER_TEMP/par/macos"
+          diff -u <(cd "$lin" && find vigia | sort) <(cd "$mac" && find vigia | sort) \
+            || { echo "FALLO: ./vigia no tiene la misma forma en los dos caminos"; exit 1; }
+          [ -d "$mac/vigia/hooks.d" ] || { echo "FALLO: falta ./vigia/hooks.d"; exit 1; }
+          [ "$(stat -c '%a' "$mac/vigia")" = "700" ] \
+            || { echo "FALLO: ./vigia no está a 700 y ahí van credenciales"; exit 1; }
+          # El vigía de macOS corre en el host, así que los hooks NO pueden usar su
+          # ruta por defecto (la que tenían montada dentro del contenedor).
+          python3 - <<PY
+          import plistlib, re, sys
+          e = plistlib.load(open("$mac/LaunchAgents/com.gh-runner.sherman.vigia.plist", "rb"))["EnvironmentVariables"]
+          assert e["VIGIA_HOOKS"] == "$mac/vigia/hooks.d", e["VIGIA_HOOKS"]
+          assert e["VIGILAR_CONF"] == "$mac/vigia/avisos.conf", e["VIGILAR_CONF"]
+          assert e["VIGIA_LATIDOS"] == "$mac/latidos", e["VIGIA_LATIDOS"]
+
+          # Y NINGUNA de las que el camino Linux le pasa al servicio 'vigia' puede
+          # faltar aquí: se leen de deploy.sh, no de una lista escrita a mano, para
+          # que añadir una allí y olvidarla aquí salga en rojo. El grep del job
+          # deploy-ps1 mira el TEXTO de los scripts; esto mira el plist ya generado,
+          # que es lo que launchd le entrega de verdad al vigía.
+          fuente = open("$GITHUB_WORKSPACE/deploy.sh").read()
+          esperadas = set(re.findall(r"VIGIA_[A-Z_]+", fuente))
+          faltan = sorted(esperadas - set(e))
+          if faltan:
+              print("FALLO: el plist del vigía no le pasa", faltan)
+              sys.exit(1)
+          print("ok: el vigía del host apunta a ./vigia, a ./latidos y recibe", len(esperadas), "variables como en Linux")
+          PY
+
+      # Un directorio no puede ser las dos cosas: los runners se llamarían igual y,
+      # como config.sh usa --replace, se robarían el registro entre sí en bucle.
+      - name: Ningún deploy pisa el despliegue del otro camino
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/cruz"; rm -rf "$d"; mkdir -p "$d/mac" "$d/lin"
+
+          ( cd "$d/mac"; sh "$GITHUB_WORKSPACE/deploy-macos.sh" --no-up --skip-validation \
+              --token F --repo o/r >/dev/null 2>&1 )
+          ( cd "$d/mac"; sh "$GITHUB_WORKSPACE/deploy.sh" --no-up --skip-validation \
+              --token F --repo o/r > salida.log 2>&1 ) \
+            && { echo "FALLO: deploy.sh pisó un despliegue de macOS"; exit 1; }
+
+          ( cd "$d/lin"; sh "$GITHUB_WORKSPACE/deploy.sh" --no-up --skip-validation \
+              --token F --repo o/r >/dev/null 2>&1 )
+          ( cd "$d/lin"; sh "$GITHUB_WORKSPACE/deploy-macos.sh" --no-up --skip-validation \
+              --token F --repo o/r > salida.log 2>&1 ) \
+            && { echo "FALLO: deploy-macos.sh pisó un despliegue de Linux"; exit 1; }
+          grep -q 'LINUX' "$d/lin/salida.log" \
+            || { echo "FALLO: no explica de quién es el directorio"; cat "$d/lin/salida.log"; exit 1; }
+          echo "ok: cada camino respeta el directorio del otro (salvo --force)"
+
   smoke:
     runs-on: ubuntu-latest
     steps:
@@ -1538,20 +1870,33 @@ jobs:
           }
           Write-Output "ok: deploy.ps1 parsea y no llama a nada inexistente"
 
-      # deploy.sh y deploy.ps1 emiten el MISMO servicio `vigia`, y el vigía lee
-      # su identidad de esas variables. Si una falta en un lado, ese sistema
-      # operativo se queda con un vigía mal identificado (VIGIA_HOST ya faltaba en
-      # Windows: sin él, el nombre del check sale del ID del contenedor y cambia
-      # en cada recreate, así que cada arranque estrena check y el anterior queda
-      # huérfano y en rojo).
-      - name: Los dos deploy emiten las mismas variables del vigía
+      # Los TRES deploy montan el mismo vigía, y el vigía lee su identidad de estas
+      # variables. Si una falta en un camino, ese sistema operativo se queda con un
+      # vigía mal identificado (VIGIA_HOST ya faltaba en Windows: sin él, el nombre
+      # del check salía del ID del contenedor y cambiaba en cada recreate, así que
+      # cada arranque estrenaba check y el anterior quedaba huérfano y en rojo).
+      #
+      # deploy-macos.sh emite además las rutas de trabajo del vigía, y ESO es
+      # correcto: en Linux y Windows el vigía es un contenedor y esas rutas son las
+      # de dentro de la imagen (sus valores por defecto), mientras que en el Mac
+      # corre en el host y hay que decírselas. Van en una lista blanca explícita
+      # para que añadir una quinta no pase inadvertida.
+      - name: Los tres deploy emiten las mismas variables del vigía
         run: |
           set -eu
-          sh_keys="$(grep -oE 'VIGIA_[A-Z_]+' deploy.sh  | sort -u)"
-          ps_keys="$(grep -oE 'VIGIA_[A-Z_]+' deploy.ps1 | sort -u)"
-          if [ "$sh_keys" != "$ps_keys" ]; then
-            echo "FALLO: deploy.sh y deploy.ps1 no emiten las mismas VIGIA_*:"
-            diff -u <(printf '%s\n' "$sh_keys") <(printf '%s\n' "$ps_keys") || true
+          claves() { grep -oE 'VIGIA_[A-Z_]+' "$1" | sort -u; }
+          # Rutas que solo tienen sentido con el vigía corriendo en el host macOS.
+          SOLO_MACOS='VIGIA_LATIDOS|VIGIA_HOOKS|VIGIA_ESTADO_FILE|VIGIA_DISCO_RUTA'
+
+          sh_keys="$(claves deploy.sh)"
+          ps_keys="$(claves deploy.ps1)"
+          mac_keys="$(claves deploy-macos.sh | grep -Ev "^(${SOLO_MACOS})$" || true)"
+
+          for otro in ps mac; do
+            eval "otras=\$${otro}_keys"
+            [ "$sh_keys" = "$otras" ] && continue
+            echo "FALLO: deploy.sh y deploy-${otro} no emiten las mismas VIGIA_*:"
+            diff -u <(printf '%s\n' "$sh_keys") <(printf '%s\n' "$otras") || true
             exit 1
-          fi
-          echo "ok: paridad de variables del vigía entre deploy.sh y deploy.ps1"
+          done
+          echo "ok: paridad de variables del vigía entre los tres deploy"
