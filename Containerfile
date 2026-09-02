@@ -64,6 +64,9 @@ RUN /home/runner/bin/installdependencies.sh \
 USER runner
 
 COPY --chown=runner:runner entrypoint.sh /home/runner/entrypoint.sh
+# mint.sh NO lleva +x abajo: no se ejecuta, se sourcea desde el entrypoint
+# (`. /home/runner/mint.sh`), y para eso basta con poder leerlo.
+COPY --chown=runner:runner mint.sh /home/runner/mint.sh
 COPY --chown=runner:runner healthcheck.sh /home/runner/healthcheck.sh
 COPY --chown=runner:runner latido.sh /home/runner/latido.sh
 COPY --chown=runner:runner vigilar.sh /home/runner/vigilar.sh

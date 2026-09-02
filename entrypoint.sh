@@ -100,80 +100,16 @@ elif [ -f "$_stamp" ]; then
 fi
 date +%s > "$_stamp"
 
-# ---------------------------------------------------------------------------
-# mint_token <registration-token|remove-token> [max_reintentos]
-# Genera un token corto usando el PAT. Imprime SOLO el token por stdout; los
-# errores van por stderr. No filtra el PAT ni el cuerpo completo a los logs.
-# ---------------------------------------------------------------------------
-mint_token() {
-    local kind="$1" max="${2:-4}" attempt=0 http body token tmp hdr retry reset remain wait_s
-    while :; do
-        tmp="$(mktemp)"; hdr="$(mktemp)"
-        http="$(curl -sSL -D "$hdr" -o "$tmp" -w '%{http_code}' \
-            -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "${API}/repos/${REPO_USER}/${REPO_NAME}/actions/runners/${kind}" \
-            2>/dev/null || true)"
-        body="$(cat "$tmp")"
-
-        if [ "$http" = "201" ] || [ "$http" = "200" ]; then
-            token="$(printf '%s' "$body" | jq -r '.token // empty')"
-            rm -f "$tmp" "$hdr"
-            if [ -z "$token" ]; then echo "ERROR: sin token en la respuesta de ${kind}." >&2; return 1; fi
-            printf '%s' "$token"; return 0
-        fi
-
-        # ¿Rate limit? 429, o 403 con x-ratelimit-remaining:0 o con Retry-After.
-        remain="$(grep -i '^x-ratelimit-remaining:' "$hdr" | tail -1 | tr -dc '0-9')"
-        if [ "$http" = "429" ] \
-           || { [ "$http" = "403" ] && [ "${remain:-1}" = "0" ]; } \
-           || { [ "$http" = "403" ] && grep -qi '^retry-after:' "$hdr"; }; then
-            retry="$(grep -i '^retry-after:' "$hdr" | tail -1 | tr -dc '0-9')"
-            if [ -z "$retry" ]; then
-                reset="$(grep -i '^x-ratelimit-reset:' "$hdr" | tail -1 | tr -dc '0-9')"
-                [ -n "$reset" ] && retry=$(( reset - $(date +%s) ))
-            fi
-            case "$retry" in ''|*[!0-9]*) retry=$(( (attempt + 1) * 15 )) ;; esac
-            [ "$retry" -lt 1 ] && retry=15
-            [ "$retry" -gt 300 ] && retry=300
-            rm -f "$tmp" "$hdr"
-            if [ "$attempt" -ge "$max" ]; then
-                echo "ERROR: rate limit de GitHub persistente en ${kind}; me rindo tras ${attempt} reintento(s)." >&2
-                return 1
-            fi
-            attempt=$(( attempt + 1 ))
-            echo "Rate limit de GitHub (HTTP ${http}); reintento ${attempt}/${max} en ${retry}s..." >&2
-            sleep "$retry"
-            continue
-        fi
-
-        # 5xx o fallo de red/DNS/TLS (http=000/vacío): transitorio → reintentar
-        # in-process en vez de salir y depender del restart (evita churn del
-        # contenedor por un blip); mantiene 401/403-perm/404 como fail-fast abajo.
-        case "${http:-000}" in
-            5[0-9][0-9]|000)
-                rm -f "$tmp" "$hdr"
-                if [ "$attempt" -ge "$max" ]; then
-                    echo "ERROR: ${kind} falló por error transitorio (HTTP ${http:-000}) tras ${attempt} reintento(s)." >&2
-                    return 1
-                fi
-                attempt=$(( attempt + 1 ))
-                wait_s=$(( attempt * 5 ))
-                echo "Error transitorio de GitHub (HTTP ${http:-000}); reintento ${attempt}/${max} en ${wait_s}s..." >&2
-                sleep "$wait_s"
-                continue
-                ;;
-        esac
-
-        # Error real (no rate limit): no reintentar.
-        echo "ERROR: la API de GitHub (${kind}) devolvió HTTP ${http:-000}." >&2
-        echo "  $(printf '%s' "$body" | jq -r '.message // "sin mensaje"' 2>/dev/null)" >&2
-        rm -f "$tmp" "$hdr"
-        return 1
-    done
-}
+# ---- Token de registro y desregistro (mint.sh) -----------------------------
+# mint_token() y deregister() viven aparte porque los VAN A COMPARTIR el
+# entrypoint de macOS y el supervisor que crea su VM. Lo que se comparte es el
+# manejo de 429/403/Retry-After: duplicado, se arregla en un sitio y el otro se
+# queda con la versión vieja. Ver la cabecera de mint.sh.
+#
+# La directiva `source=` es para shellcheck: sin ella no sigue el fichero,
+# no ve que mint.sh consume API/REPO_USER/REPO_NAME y las marca como sin usar.
+# shellcheck source=mint.sh
+. /home/runner/mint.sh
 
 # ---- Leer un secret de fichero con fallback a sudo -------------------------
 # Los file-secrets de compose se montan root:root 0400; el usuario 'runner' no
@@ -224,19 +160,6 @@ forward_signal() {
     [ -n "$RUNNER_PID" ] && kill -TERM "$RUNNER_PID" 2>/dev/null || true
 }
 trap forward_signal INT TERM
-
-deregister() {
-    echo "Desregistrando el runner (si sigue registrado)..." >&2
-    if [ -n "${ACCESS_TOKEN:-}" ]; then
-        local rt
-        rt="$(mint_token remove-token 0 2>/dev/null || true)"   # sin reintentos: no demorar el stop
-        [ -n "$rt" ] && ./config.sh remove --token "$rt" >/dev/null 2>&1 || true
-    else
-        # Con RUNNER_TOKEN legacy no se puede mintear un remove-token; se intenta
-        # con el mismo token (funciona solo si aún no ha caducado).
-        ./config.sh remove --token "${REG_TOKEN}" >/dev/null 2>&1 || true
-    fi
-}
 
 # ---- Reset de config local efímera huérfana --------------------------------
 # Normalmente un runner --ephemeral borra su config local (.runner/.credentials)

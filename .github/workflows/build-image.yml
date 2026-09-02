@@ -18,6 +18,7 @@ on:
       # del Containerfile: no basta con acordarse.
       - Containerfile
       - entrypoint.sh
+      - mint.sh
       - healthcheck.sh
       - latido.sh
       - vigilar.sh

@@ -457,7 +457,14 @@ esac
 if [ "$SKIP_VALIDATION" != "yes" ]; then
     command -v curl >/dev/null 2>&1 || err "falta 'curl' para validar el token. Instálalo o pasa --skip-validation."
     info "Validando el token contra la API de GitHub..."
-    _tmp="$(mktemp)"
+    # mktemp CON plantilla: el `mktemp` a secas de BSD (macOS) exige -t o una
+    # plantilla y falla sin ella. Esto corre en el HOST, y un host macOS es
+    # justo el caso del fleet con Mac. Con `set -eu` el script muere aquí
+    # mismo escupiendo `usage: mktemp [-d] [-q] [-t prefix] [-u] template ...`
+    # justo después de "Validando el token": ni aborta con el error del token
+    # ni dice qué script falló, así que se lee como un problema del PAT.
+    # Medido con un mktemp que imita al de BSD. Misma forma que en mint.sh.
+    _tmp="$(mktemp "${TMPDIR:-/tmp}/gh-runner-deploy.XXXXXX")"
     # El PAT va por --config (stdin), NO por argv, para no exponerlo en `ps`.
     _http="$(printf 'header = "Authorization: Bearer %s"' "$TOKEN" \
         | curl -sSL -o "$_tmp" -w '%{http_code}' --config - \
