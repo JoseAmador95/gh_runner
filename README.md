@@ -9,12 +9,18 @@ Características:
 - **Cache persistente:** cada runner conserva su clone (`.git` en `_work`) y sus caches → `actions/checkout` hace *fetch* incremental en vez de clonar desde cero.
 - **Multi-arch:** imagen `linux/arm64` + `linux/amd64` publicada en GHCR.
 - **Compose declarativo:** `deploy.sh` genera un `compose.yaml` con `restart: always` para N runners.
+- **macOS nativo (opt-in):** en un Mac de Apple Silicon, `deploy-macos.sh` despliega runners en VMs efímeras de Tart en vez de contenedores — imprescindible para jobs que necesitan macOS de verdad (`codesign`, Xcode). Ver **§10**.
 
 ---
 
 ## Requisitos por sistema operativo
 
 Siempre es un **contenedor Linux** (Ubuntu 24.04). **`deploy.sh`/`deploy.ps1` hacen el bootstrap del entorno**: si falta `podman`, el proveedor de compose o (en macOS/Windows) la *machine*, los instalan/crean automáticamente. Opt-out con `--no-bootstrap` / `-NoBootstrap` si prefieres gestionarlo tú.
+
+> Esta tabla es para el camino de **contenedores** (Linux/Windows, y macOS como _host_ que corre
+> Podman). Si necesitas un runner que sea **macOS de verdad** — firmar una app de iOS, correr
+> Xcode — no hay contenedores de macOS: ese es el camino nativo con VMs de Tart, documentado
+> aparte en **§10**.
 
 | Host | Gestor | Qué instala/crea el bootstrap |
 |------|--------|-------------------------------|
@@ -513,6 +519,150 @@ podman compose restart vigia                                    # aplicar un cam
 - **Latido rancio = caído.** Si un runner deja de publicar durante más de `VIGIA_RANCIO` (120 s), se da por caído: cubre el contenedor parado, borrado o congelado. No distingue entre ellos, y operativamente es la misma alerta.
 - **Umbral del reloj:** avisa a partir de 60 s de desfase (`VIGIA_DESFASE_MAX`). Se mide **desde dentro del contenedor**, que es el reloj que los runners usan de verdad; en macOS ese es el de la VM de podman, que es la que se desincroniza al suspender.
 - **Windows:** el bit de ejecución puede no sobrevivir al *bind mount* de `./vigia`. Si el informe dice «Hooks ignorados», corre `podman compose exec vigia chmod +x /etc/gh-runner/vigia/hooks.d/*.sh`.
+
+---
+
+## 10. Runners de macOS (nativos): VMs efímeras con Tart
+
+Todo lo de arriba (§1-§9) es el camino de **contenedores**: Linux siempre, en cualquier host. Si el
+job necesita **macOS de verdad** —firmar una app de iOS con `codesign`, compilar con Xcode— no hay
+contenedores de macOS, así que este camino usa VMs completas con **Tart** (Cirrus Labs) en vez de
+Podman/Docker. El porqué de cada decisión, con el incidente concreto que la motiva, está en
+[`docs/adr/0001-runners-macos-con-tart.md`](docs/adr/0001-runners-macos-con-tart.md); esta sección
+es la operativa.
+
+**Mismo comando, mismas ideas, otra pieza debajo.** `deploy-macos.sh` es el hermano de `deploy.sh`
+y comparte a propósito la mayor parte de su CLI: quien ya despliega el camino Linux no aprende nada
+nuevo. Lo que cambia es lo que no existe en macOS:
+
+| Aspecto     | Linux/Windows (`deploy.sh`/`deploy.ps1`)                           | macOS (`deploy-macos.sh`)                                                                                                         |
+| ----------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| Runtime     | Podman/Docker (contenedor)                                         | Tart (VM completa, `Virtualization.framework`)                                                                                    |
+| Imagen      | `ghcr.io/joseamador95/gh_runner:latest` (imagen OCI)               | VM «golden» clonada de una imagen OCI (`ghcr.io/cirruslabs/macos-sequoia-xcode:16.4`), horneada localmente por `hornear-macos.sh` |
+| Efímero     | El propio contenedor se recrea (`--ephemeral` + `restart: always`) | La VM entera se destruye cada job (`tart clone` → `tart run` → `tart delete`)                                                     |
+| Supervisión | `restart: always` del motor de contenedores                        | `supervisar-macos.sh`, un proceso por slot bajo un LaunchAgent con `KeepAlive`                                                    |
+| Despliegue  | `podman compose up -d` / `docker compose up -d`                    | `./macos-ctl.sh up` (`launchctl bootstrap` de los LaunchAgents)                                                                   |
+| Vigía       | Servicio `vigia` del propio `compose.yaml`                         | LaunchAgent aparte en el host, opt-in con `--vigilar`                                                                             |
+
+### Requisitos del Mac
+
+- **Apple Silicon.** Tart solo virtualiza macOS en `arm64`; el bootstrap avisa si detecta otra
+  arquitectura. macOS 13 (Ventura) o superior.
+- **Inicio de sesión automático, sin excepción.** El runner arranca por un LaunchAgent dentro de la
+  sesión gráfica (Aqua); sin sesión iniciada no hay `codesign` (ver el ADR). Configúralo en
+  Ajustes del Sistema → Usuarios y grupos → Inicio de sesión automático.
+- **Sin suspensión.** Un Mac dormido deja los jobs encolados sin ningún error visible:
+  ```bash
+  sudo pmset -a sleep 0 disablesleep 1
+  ```
+- **Herramientas del host:**
+  ```bash
+  brew install cirruslabs/cli/tart jq
+  ```
+- **`sshpass`, solo para hornear la golden** (`hornear-macos.sh --completo --provisionar …`). No
+  está en homebrew-core por licencia:
+  ```bash
+  brew install hudochenkov/sshpass/sshpass
+  ```
+
+### Presupuesto de disco
+
+Con un Mac de menos de 500 GB libres, el disco es el recurso escaso:
+
+| Partida                     | Tamaño   | Nota                                              |
+| --------------------------- | -------- | ------------------------------------------------- |
+| Caché OCI de la imagen base | 50-60 GB | Se libera con `tart prune` al terminar de hornear |
+| VM golden ya aprovisionada  | 60-80 GB | Vive mientras el despliegue esté activo           |
+| Clon efímero de un job      | 15-30 GB | Uno por slot, mientras el job corre               |
+
+Con un solo slot ya son **~150-170 GB** comprometidos. Por eso la base por defecto es
+`ghcr.io/cirruslabs/macos-sequoia-xcode:16.4` —**un solo** Xcode—: no uses
+`ghcr.io/cirruslabs/macos-runner:tahoe` (trae tres versiones de Xcode y ronda los 100 GB) salvo que
+de verdad necesites cambiar de versión entre jobs.
+
+### RAM
+
+Con un Mac de 32 GB, lo recomendado es `--count 1 --memory 20G`. Dos VMs compilando a la vez dejan
+~8 GB al anfitrión: el conjunto entra a swap y los dos jobs tardan más que uno solo. Sube a
+`--count 2` solo si de verdad ves jobs encolados, y entonces baja `--memory` a `12G`.
+
+### El límite de 2 VMs por Mac
+
+`deploy-macos.sh` **aborta** con `--count` por encima de 2, y no es un límite de este script: el
+EULA de macOS autoriza como mucho dos instancias virtualizadas a la vez sobre un Mac con licencia, y
+`Virtualization.framework` lo hace cumplir (la tercera VM directamente no arranca). Si hace falta
+más capacidad, se añade otro Mac con su propio despliegue, no un `--count 3`.
+
+### Flujo de despliegue completo
+
+```bash
+mkdir ~/gh-runner-macos && cd ~/gh-runner-macos
+./deploy-macos.sh --repo OWNER/REPO --token github_pat_XXXX --count 1 --memory 20G --prefix ci
+```
+
+Sin la golden ni el tarball del agente todavía, `deploy-macos.sh` genera los ficheros del
+despliegue, te dice exactamente qué falta y **no** levanta nada. Hornéalos:
+
+```bash
+./hornear-macos.sh --completo \
+    --base ghcr.io/cirruslabs/macos-sequoia-xcode:16.4 \
+    --golden gh-runner-golden \
+    --provisionar ./mi-provisionar.sh
+HORNEAR_RUNNER_DIR=./montaje ./hornear-macos.sh --runner
+```
+
+`--completo` clona la base, la arranca, la aprovisiona por `ssh` con tu script (el equivalente de un
+`FROM` en un `Containerfile` derivado) y, al terminar, **ya libera sola** la caché OCI de la base con
+`tart prune` — no hace falta repetirlo a mano. Con la golden y el agente listos:
+
+```bash
+./macos-ctl.sh up
+```
+
+### Operación diaria: `macos-ctl.sh`
+
+`launchctl` no tiene los verbos de `podman compose`, así que `deploy-macos.sh` genera
+`macos-ctl.sh` con los mismos verbos que ya conoces (§4), traducidos:
+
+| Acción                         | `podman compose` (Linux)          | `macos-ctl.sh` (macOS)         |
+| ------------------------------ | --------------------------------- | ------------------------------ |
+| Estado                         | `podman compose ps`               | `./macos-ctl.sh ps`            |
+| Logs de un runner              | `podman compose logs -f runner-1` | `./macos-ctl.sh logs runner-1` |
+| Levantar                       | `podman compose up -d`            | `./macos-ctl.sh up`            |
+| Parar (desregistra)            | `podman compose down`             | `./macos-ctl.sh down`          |
+| Parar + borrar estado y caches | `podman compose down -v`          | `./macos-ctl.sh down -v`       |
+| Rehornear la golden            | —                                 | `./macos-ctl.sh refresh`       |
+| Ronda del vigía ahora mismo    | —                                 | `./macos-ctl.sh informe`       |
+
+`down` (con o sin `-v`) siempre borra las VMs efímeras del cluster: son decenas de GB cada una y, si
+quedaran, `tart clone` fallaría en la vuelta siguiente por nombre duplicado. La golden **nunca** se
+toca con `down`: rehacerla son 60-80 GB y un buen rato; para eso está `refresh`.
+
+### Mantenimiento: dos cadencias, no una
+
+- **`./hornear-macos.sh --runner` — diaria.** Solo baja y verifica el tarball de
+  `actions/runner` en el host; no toca la golden. GitHub sube la versión mínima del agente a
+  menudo (igual que en el camino Linux, §7), y el invitado lo desempaqueta en segundos al
+  arrancar.
+- **`./hornear-macos.sh --completo` (o `./macos-ctl.sh refresh`) — semanal.** Rehace la golden
+  entera: solo hace falta cuando cambia el sistema o el toolchain (Xcode, Node, lo que aprovisione
+  tu script). Re-hornear 60-80 GB a diario para adoptar un bump de ~300 MB del agente sería tirar
+  el presupuesto de disco a la basura; por eso las dos cadencias van separadas.
+
+### La excepción a la premisa de «sin `launchd`»
+
+El resto de este README (§9) dice que el vigía corre como contenedor «para que el agendado lo haga
+el motor de contenedores, que es la única capa idéntica en Linux, macOS y Windows: no hay
+`systemd`, ni `launchd`, ni tarea programada que mantener». En este camino **sí** hay `launchd` que
+mantener: `supervisar-macos.sh` (uno por slot) y, opt-in con `--vigilar`, el propio vigía corren
+como LaunchAgents del usuario, gestionados por `deploy-macos.sh`/`macos-ctl.sh` con
+`launchctl bootstrap`/`bootout`.
+
+Es una excepción deliberada y acotada a este único camino: aquí no hay motor de contenedores del
+que apoyarse —el ciclo de un job (clonar, arrancar y destruir una VM) **ya** necesita un proceso que
+lo repita indefinidamente—, así que el coste de mantener `launchd` ya está pagado por
+`supervisar-macos.sh` antes de que exista el vigía. El detalle, y por qué la alternativa de meter un
+`podman machine` solo para el vigía mediría el reloj equivocado, está en el ADR.
 
 ---
 
