@@ -94,7 +94,6 @@ cargar_env "${MONTAJE}/.env"
 : "${REPO_USER:?Falta REPO_USER (owner del repositorio)}"
 : "${REPO_NAME:?Falta REPO_NAME (nombre del repositorio)}"
 
-API="${GITHUB_API_URL:-https://api.github.com}"
 REPO_URL="https://github.com/${REPO_USER}/${REPO_NAME}"
 RUNNER_NAME="${RUNNER_NAME:-$(hostname)-${REPO_USER}-${REPO_NAME}}"
 RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,macOS,ARM64}"

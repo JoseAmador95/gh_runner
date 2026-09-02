@@ -19,6 +19,12 @@ jobs:
       - uses: ludeeus/action-shellcheck@master
         with:
           severity: warning
+          # -x hace que shellcheck SIGA las directivas `# shellcheck source=`.
+          # Sin él la acción revisa fichero a fichero y esas directivas son
+          # inertes: no comprueban nada y dan la falsa impresión de cubrir el
+          # `source` de mint.sh. Verificar con `shellcheck *.sh` en local no lo
+          # delata, porque pasando todos los ficheros a la vez sí los sigue.
+          additional_arguments: -x
 
   hadolint:
     runs-on: ubuntu-latest

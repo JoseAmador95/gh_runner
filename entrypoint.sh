@@ -25,7 +25,6 @@ set -euo pipefail
 : "${REPO_USER:?Falta REPO_USER (owner del repositorio)}"
 : "${REPO_NAME:?Falta REPO_NAME (nombre del repositorio)}"
 
-API="${GITHUB_API_URL:-https://api.github.com}"
 REPO_URL="https://github.com/${REPO_USER}/${REPO_NAME}"
 # RUNNER_NAME se usa TAL CUAL si viene dado (deploy.sh ya pasa el nombre final).
 # Solo cuando no se proporciona se genera un default único por host + repo.

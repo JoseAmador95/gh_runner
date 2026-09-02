@@ -30,7 +30,7 @@
 # Variables de entorno que espera de quien lo sourcea:
 #   ACCESS_TOKEN  -> PAT con Administration:R/W sobre el repo
 #   REPO_USER / REPO_NAME -> owner y nombre del repo
-#   API           -> base de la API (p. ej. https://api.github.com)
+#   GITHUB_API_URL-> base de la API (opcional; por defecto https://api.github.com)
 # ============================================================================
 
 # ---------------------------------------------------------------------------
@@ -38,6 +38,12 @@
 # Genera un token corto usando el PAT. Imprime SOLO el token por stdout; los
 # errores van por stderr. No filtra el PAT ni el cuerpo completo a los logs.
 # ---------------------------------------------------------------------------
+# La base de la API la deriva este fichero, no quien lo sourcea: es la unica
+# pieza que la consume, y tenerla declarada en los entrypoints la dejaba
+# asignada-y-sin-usar para shellcheck, que revisa fichero a fichero.
+# Se respeta un API ya puesto por si alguien lo fijo antes de sourcear.
+API="${API:-${GITHUB_API_URL:-https://api.github.com}}"
+
 mint_token() {
     _mt_kind="$1"; _mt_max="${2:-4}"; _mt_attempt=0
     # Inicializadas aquí porque sin `local` sobreviven a la llamada anterior:
