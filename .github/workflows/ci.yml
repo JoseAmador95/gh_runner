@@ -829,6 +829,231 @@ jobs:
             || { echo "FALLO: medir el host tapó lo que reportó el runner"; informe "$d"; exit 1; }
           echo "ok: VIGIA_DISCO_RUTA añade la medición del host sin tapar la del runner"
 
+  # Los runners de macOS corren en una VM de Tart que se clona, hace UN job y se
+  # destruye. Nada de eso se puede montar en un runner de Linux, así que lo que
+  # se prueba aquí es el guion del invitado —entrypoint-macos.sh— con todo lo de
+  # fuera stubeado: curl, tar, xattr y sudo. Sin esto, cada regresión suya se
+  # descubriría con una VM que arranca, no toma ningún job y se apaga sola: desde
+  # el host es indistinguible de «no había trabajo».
+  macos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Banco de pruebas (montajes falsos y stubs en el PATH)
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/mac"; rm -rf "$d"; mkdir -p "$d"
+
+          # Un banco de pruebas por caso: montaje de solo lectura (como el que pasa
+          # `tart run --dir=`), montaje de latidos, HOME de la VM y stubs en el PATH.
+          # Todo lo que el script invoca fuera de bash es de mentira: este job corre en
+          # Linux y no hay ni VM, ni Gatekeeper, ni GitHub.
+          cat > "$d/banco.sh" <<'BANCO'
+          # preparar <dir> — deja el banco listo y exporta B/REG.
+          preparar() {
+            B="$1"; REG="$B/reg"; export B REG
+            rm -rf "$B"; mkdir -p "$B/montaje" "$B/latidos" "$B/home" "$B/bin" "$REG"
+            cp "$GITHUB_WORKSPACE/mint.sh" "$GITHUB_WORKSPACE/latido.sh" \
+               "$GITHUB_WORKSPACE/healthcheck.sh" "$B/montaje/"
+            chmod +x "$B/montaje/latido.sh" "$B/montaje/healthcheck.sh"
+            printf 'PAT-DE-PRUEBA\n' > "$B/montaje/access_token"
+            # El tarball puede estar vacío: lo desempaqueta el `tar` de mentira.
+            : > "$B/montaje/actions-runner-osx-arm64-9.9.9.tar.gz"
+
+            # curl falso: responde 201 con un token y anota a qué URL se llamó, que es
+            # como se comprueba si hubo registration-token y/o remove-token.
+            cat > "$B/bin/curl" <<'STUB'
+          #!/bin/sh
+          hdr=""; out=""; url=""; prev=""
+          for a in "$@"; do
+            case "$prev" in -D) hdr="$a" ;; -o) out="$a" ;; esac
+            case "$a" in https://*) url="$a" ;; esac
+            prev="$a"
+          done
+          echo "$url" >> "$REG/red.log"
+          [ -n "$hdr" ] && : > "$hdr"
+          [ -n "$out" ] && printf '{"token":"TOKEN-DE-REGISTRO"}' > "$out"
+          printf '201'
+          STUB
+
+            # tar falso: en vez de desempaquetar, planta el config.sh y el run.sh de
+            # mentira en el destino de -C, que es lo que el script va a ejecutar.
+            cat > "$B/bin/tar" <<'STUB'
+          #!/bin/sh
+          dest="."; prev=""
+          for a in "$@"; do [ "$prev" = "-C" ] && dest="$a"; prev="$a"; done
+          echo "tar $*" >> "$REG/llamadas.log"
+          mkdir -p "$dest"
+          cat > "$dest/config.sh" <<'EOS'
+          #!/bin/sh
+          echo "config.sh $*" >> "$REG/llamadas.log"
+          [ "$1" = "remove" ] && exit 0
+          : > .runner
+          exit 0
+          EOS
+          cat > "$dest/run.sh" <<'EOS'
+          #!/bin/sh
+          echo "run.sh trap_sig=${RUNNER_MANUALLY_TRAP_SIG:-no}" >> "$REG/llamadas.log"
+          if [ "${RUN_MODO:-rapido}" = "lento" ]; then
+            trap 'echo "run.sh recibio la senal" >> "$REG/llamadas.log"; exit 0' TERM
+            sleep 30 & wait $!
+          fi
+          exit 0
+          EOS
+          chmod +x "$dest/config.sh" "$dest/run.sh"
+          STUB
+
+            # xattr y sudo falsos. El de xattr anota TAMBIÉN el directorio de trabajo:
+            # el script llama `xattr -dr … .`, y lo que importa es sobre qué directorio.
+            printf '#!/bin/sh\necho "xattr(%s) $*" >> "$REG/llamadas.log"\n' '$PWD' > "$B/bin/xattr"
+            printf '#!/bin/sh\necho "sudo $*" >> "$REG/llamadas.log"\nexit 0\n' > "$B/bin/sudo"
+            chmod +x "$B/bin"/*
+          }
+
+          # arrancar — lanza el entrypoint con el banco puesto. Argumentos extra = env.
+          entorno() {
+            printf '%s\n' "PATH=$B/bin:$PATH" "HOME=$B/home" "REG=$REG" \
+              "GH_RUNNER_MONTAJE=$B/montaje" "GH_RUNNER_LATIDOS=$B/latidos" \
+              REPO_USER=sherman REPO_NAME=app RUNNER_NAME=mac-1 \
+              RUNNER_LABELS=self-hosted,macOS,sherman
+          }
+          BANCO
+
+      # El ciclo completo de una VM: mintear el token, desempaquetar el agente en
+      # $HOME, registrarse EFÍMERO y apagar. El apagado es el que más silencio
+      # tiene si se pierde: `tart run` no retorna, el supervisor no hace `tart
+      # delete` ni clona el relevo, y el fleet se para sin que falle nada.
+      - name: Ciclo sano de una VM efímera
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/mac"
+          . "$d/banco.sh"
+          preparar "$d/sano"
+
+          # shellcheck disable=SC2046
+          env $(entorno) timeout 60 bash "$GITHUB_WORKSPACE/entrypoint-macos.sh" \
+            > "$B/salida.log" 2>&1 || { echo "FALLO: el ciclo sano salió con error"; cat "$B/salida.log"; exit 1; }
+          # El latido corre en segundo plano y sobrevive al entrypoint: se le da un
+          # momento para publicar su primera línea antes de recogerlo.
+          i=0; while [ "$i" -lt 25 ] && [ ! -f "$B/latidos/mac-1" ]; do sleep 0.2; i=$((i+1)); done
+          pkill -f "$B/montaje/latido.sh" 2>/dev/null || true
+
+          cfg="$(grep '^config\.sh ' "$REG/llamadas.log" | head -n1)"
+          for flag in --unattended --replace --ephemeral --disableupdate; do
+            case "$cfg" in *"$flag"*) : ;; *) echo "FALLO: config.sh sin $flag: $cfg"; exit 1 ;; esac
+          done
+          case "$cfg" in *"--name mac-1"*) : ;; *) echo "FALLO: nombre del runner: $cfg"; exit 1 ;; esac
+          case "$cfg" in *"--labels self-hosted,macOS,sherman"*) : ;; *) echo "FALLO: labels: $cfg"; exit 1 ;; esac
+          case "$cfg" in *"--work _work"*) : ;; *) echo "FALLO: --work: $cfg"; exit 1 ;; esac
+          grep -q 'registration-token' "$REG/red.log" || { echo "FALLO: no minteó token de registro"; exit 1; }
+          grep -q '^sudo shutdown -h now' "$REG/llamadas.log" \
+            || { echo "FALLO: la VM no se apagó; 'tart run' no retorna y el supervisor no lanza el relevo"; cat "$REG/llamadas.log"; exit 1; }
+          [ -f "$B/latidos/mac-1" ] || { echo "FALLO: latido.sh no publicó nada en el montaje de latidos"; exit 1; }
+          [ -f "$B/home/actions-runner/config.sh" ] || { echo "FALLO: el agente no se desempaquetó en \$HOME"; exit 1; }
+          echo "ok: ciclo sano completo (token, config efímera, latido y apagado)"
+
+      # Lo que llega de un tarball y de un montaje virtiofs arrastra
+      # com.apple.quarantine, y con él Gatekeeper mata Runner.Listener sin dejar
+      # una traza que señale la causa. Que el `xattr` exista no basta: si va
+      # DESPUÉS de config.sh, para entonces el agente ya ejecutó sus binarios.
+      - name: La cuarentena se quita antes de config.sh
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/mac"
+          . "$d/banco.sh"
+          preparar "$d/gatekeeper"
+
+          # shellcheck disable=SC2046
+          env $(entorno) timeout 60 bash "$GITHUB_WORKSPACE/entrypoint-macos.sh" >/dev/null 2>&1 || true
+          pkill -f "$B/montaje/latido.sh" 2>/dev/null || true
+
+          n_x="$(grep -n 'xattr(.*) -dr com\.apple\.quarantine' "$REG/llamadas.log" | head -n1 | cut -d: -f1 || true)"
+          n_c="$(grep -n '^config\.sh ' "$REG/llamadas.log" | head -n1 | cut -d: -f1 || true)"
+          [ -n "$n_x" ] || { echo "FALLO: nunca se quitó com.apple.quarantine; Gatekeeper mata Runner.Listener sin traza útil"; cat "$REG/llamadas.log"; exit 1; }
+          [ -n "$n_c" ] || { echo "FALLO: no se llegó a config.sh"; exit 1; }
+          [ "$n_x" -lt "$n_c" ] \
+            || { echo "FALLO: el xattr va DESPUÉS de config.sh; para entonces el agente ya arrancó binarios en cuarentena"; cat "$REG/llamadas.log"; exit 1; }
+          grep -q "xattr($B/home/actions-runner)" "$REG/llamadas.log" \
+            || { echo "FALLO: el xattr no se aplicó sobre el directorio del runner"; cat "$REG/llamadas.log"; exit 1; }
+          echo "ok: la cuarentena se quita sobre el runner y antes de config.sh"
+
+      # Parada elegante mientras el runner está idle. Sin el reenvío de la señal
+      # con RUNNER_MANUALLY_TRAP_SIG=1, run.sh no drena y el runner muere sin
+      # desregistrarse: queda un fantasma en Settings -> Runners que ningún ciclo
+      # posterior limpia (la VM siguiente estrena nombre).
+      - name: SIGTERM drena run.sh y desregistra el runner idle
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/mac"
+          . "$d/banco.sh"
+          preparar "$d/senal"
+
+          # RUN_MODO=lento: run.sh se queda esperando, como un runner idle a la espera de
+          # un job. Es el único estado en el que hay que desregistrar a mano.
+          # shellcheck disable=SC2046
+          env $(entorno) RUN_MODO=lento bash "$GITHUB_WORKSPACE/entrypoint-macos.sh" >"$B/salida.log" 2>&1 &
+          pid=$!
+
+          i=0
+          while [ "$i" -lt 100 ] && ! grep -q '^run\.sh ' "$REG/llamadas.log" 2>/dev/null; do sleep 0.1; i=$((i+1)); done
+          grep -q '^run\.sh ' "$REG/llamadas.log" || { echo "FALLO: run.sh no llegó a arrancar"; cat "$B/salida.log"; exit 1; }
+
+          kill -TERM "$pid"
+          rc=0; wait "$pid" || rc=$?
+          pkill -f "$B/montaje/latido.sh" 2>/dev/null || true
+
+          grep -q 'run\.sh trap_sig=1' "$REG/llamadas.log" \
+            || { echo "FALLO: sin RUNNER_MANUALLY_TRAP_SIG=1 run.sh no reenvía la señal a Runner.Listener y el runner muere sin desregistrarse"; exit 1; }
+          grep -q 'run\.sh recibio la senal' "$REG/llamadas.log" \
+            || { echo "FALLO: la señal no se reenvió a run.sh: se quedaría el job a medias y sin drenar"; cat "$REG/llamadas.log"; exit 1; }
+          grep -q 'remove-token' "$REG/red.log" \
+            || { echo "FALLO: no se pidió remove-token: el runner idle queda de fantasma en GitHub"; cat "$REG/red.log"; exit 1; }
+          grep -q '^config\.sh remove ' "$REG/llamadas.log" \
+            || { echo "FALLO: no se ejecutó 'config.sh remove'"; cat "$REG/llamadas.log"; exit 1; }
+          grep -q '^sudo shutdown -h now' "$REG/llamadas.log" \
+            || { echo "FALLO: tras la parada la VM no se apagó"; exit 1; }
+          [ "$rc" -eq 0 ] || { echo "FALLO: la parada elegante no salió con 0 (rc=$rc)"; exit 1; }
+          echo "ok: SIGTERM se reenvía a run.sh, el runner se desregistra y la VM se apaga"
+
+      # macOS trae bash 3.2 y ahí no hay bash 4. Este candado es barato y evita
+      # el peor camino: el script no arranca, la VM se apaga sola y el supervisor
+      # lo lee como un ciclo más sin trabajo.
+      - name: Compatible con el bash 3.2 de macOS
+        run: |
+          set -eu
+          # Los comentarios se vacían (conservando el número de línea): la cabecera del
+          # script NOMBRA a propósito lo que está prohibido, y sin esto se delataría a sí
+          # misma. Lo que se audita es el código.
+          codigo="$RUNNER_TEMP/mac-codigo.sh"
+          sed 's/^[[:space:]]*#.*$//' "$GITHUB_WORKSPACE/entrypoint-macos.sh" > "$codigo"
+
+          malo=0
+          # Arrays asociativos: bash 4. En el bash 3.2 de macOS `declare -A x` no declara
+          # nada y `x[clave]=v` acaba escribiendo en el índice 0 del array indexado: no
+          # falla, guarda mal, y el síntoma aparece mucho después.
+          if grep -nE '(declare|local|typeset)[[:space:]]+-[A-Za-z]*A' "$codigo"; then
+            echo "FALLO: array asociativo (bash 4); macOS trae bash 3.2"; malo=1
+          fi
+          # Cambio de caja ${x,,} / ${x^^}: bash 4. En 3.2 es error de SINTAXIS, así que
+          # el script ni arranca y la VM se apaga sin haber tomado un solo job.
+          if grep -nE '\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?(,,|\^\^|,|\^)[^}]*\}' "$codigo"; then
+            echo "FALLO: cambio de caja \${x,,}/\${x^^} (bash 4); macOS trae bash 3.2"; malo=1
+          fi
+          # mapfile/readarray: también bash 4, y su ausencia es silenciosa (con `|| true`
+          # alrededor deja el array vacío y el script sigue como si nada).
+          if grep -nE '\b(mapfile|readarray)\b' "$codigo"; then
+            echo "FALLO: mapfile/readarray (bash 4); macOS trae bash 3.2"; malo=1
+          fi
+          # Y las dos herencias de Linux que aquí no existen: en la VM el usuario es
+          # `admin` (su casa es /Users/admin) y el paquete osx-arm64 no trae
+          # installdependencies.sh, así que llamarlo aborta el arranque.
+          if grep -n '/home/runner\|installdependencies' "$codigo"; then
+            echo "FALLO: ruta o script de Linux en el entrypoint de macOS"; malo=1
+          fi
+          [ "$malo" -eq 0 ] || exit 1
+          echo "ok: nada de bash 4 ni rutas de Linux"
+
   smoke:
     runs-on: ubuntu-latest
     steps:
