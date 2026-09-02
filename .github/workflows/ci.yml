@@ -1060,6 +1060,318 @@ jobs:
           [ "$malo" -eq 0 ] || exit 1
           echo "ok: nada de bash 4 ni rutas de Linux"
 
+  # El supervisor es lo que en macOS sustituye a `restart: always`, y sus
+  # fallos son todos silenciosos: una VM que se queda no da error (da 60 GB
+  # menos de disco y un slot que ya no arranca), y un runner fantasma en
+  # GitHub no da error (da un "caído" perpetuo en el panel del vigía). Por eso
+  # todo lo que se afirma aquí es sobre el ARGV de lo que se invoca.
+  supervisor-macos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Banco de pruebas (stubs de tart, ssh y curl en el PATH)
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/sup"; rm -rf "$d"; mkdir -p "$d"
+
+          # Todo lo que el supervisor invoca fuera del shell es de mentira: este job
+          # corre en Linux y no hay ni Tart, ni VM, ni GitHub. Lo que se comprueba es
+          # el ORDEN y el CONTENIDO de lo que se les manda, que es donde viven los
+          # fallos caros (una VM que se queda, un fantasma que nadie limpia).
+          cat > "$d/banco.sh" <<'BANCO'
+          # preparar <dir> — deja el banco listo y exporta B/REG.
+          preparar() {
+            B="$1"; REG="$B/reg"; export B REG
+            rm -rf "$B"; mkdir -p "$B/montaje" "$B/latidos" "$B/estado" "$B/home" "$B/bin" "$REG"
+            cp "$GITHUB_WORKSPACE/mint.sh" "$GITHUB_WORKSPACE/latido.sh" "$B/montaje/"
+            printf 'PAT-SECRETO-abc123\n' > "$B/montaje/access_token"
+            : > "$B/conf.env"
+            : > "$REG/tart.log"; : > "$REG/ssh.log"; : > "$REG/curl.log"
+
+            # tart falso: registra su argv COMPLETO. Es lo que permite afirmar el orden
+            # del ciclo y, de paso, que el PAT no viaja en ninguna línea de comandos.
+            cat > "$B/bin/tart" <<'STUB'
+          #!/bin/sh
+          echo "tart $*" >> "$REG/tart.log"
+          case "$1" in
+            list)
+              echo "Source Name Disk Size State"
+              [ -n "${TART_CENSO:-}" ] && printf '%s\n' "$TART_CENSO"
+              exit 0 ;;
+            # TEST-NET-1 (RFC 5737): jamás enrutable, así que un ssh que se escapara
+            # del stub no puede acabar hablando con una máquina de verdad.
+            ip) echo "192.0.2.10"; exit 0 ;;
+            run)
+              # Modela al invitado: se queda encendido hasta que le piden drenar (el
+              # `pkill` por ssh), que es cuando `tart run` retorna de verdad.
+              if [ -n "${TART_RUN_ESPERA:-}" ]; then
+                i=0
+                while [ "$i" -lt 200 ]; do
+                  [ -f "$REG/ssh-pkill" ] && break
+                  sleep 0.1; i=$((i+1))
+                done
+              fi
+              ;;
+          esac
+          [ "${TART_RC_CMD:-}" = "$1" ] && exit "${TART_RC:-0}"
+          exit 0
+          STUB
+
+            # ssh falso: registra el argv y deja la marca que hace retornar al `tart run`.
+            cat > "$B/bin/ssh" <<'STUB'
+          #!/bin/sh
+          echo "ssh $*" >> "$REG/ssh.log"
+          case "$*" in *pkill*) : > "$REG/ssh-pkill" ;; esac
+          exit 0
+          STUB
+
+            # curl falso: solo lo que usa desregistrar_por_api. Devuelve el fantasma con
+            # el nombre que espera el caso y anota el método de cada llamada.
+            cat > "$B/bin/curl" <<'STUB'
+          #!/bin/sh
+          url=""; metodo="GET"; prev=""
+          for a in "$@"; do
+            case "$prev" in -X) metodo="$a" ;; esac
+            case "$a" in https://*) url="$a" ;; esac
+            prev="$a"
+          done
+          echo "$metodo $url" >> "$REG/curl.log"
+          [ "$metodo" = "GET" ] && printf '{"runners":[{"id":77,"name":"%s"}]}' "${VM_ESPERADA:-x}"
+          exit 0
+          STUB
+            chmod +x "$B/bin"/*
+          }
+
+          # sleep falso: el backoff llega a 300 s y ninguna prueba puede tardar eso.
+          # Registra lo que se le pidió y vuelve al instante.
+          stub_sleep() {
+            cat > "$B/bin/sleep" <<'STUB'
+          #!/bin/sh
+          echo "sleep $1" >> "$REG/sleep.log"
+          exit 0
+          STUB
+            chmod +x "$B/bin/sleep"
+          }
+
+          # supervisar [args…] — lanza el supervisor con el banco puesto.
+          supervisar() {
+            env PATH="$B/bin:$PATH" HOME="$B/home" REG="$REG" \
+                REPO_USER=sherman REPO_NAME=app ACCESS_TOKEN=PAT-SECRETO-abc123 \
+                VM_ESPERADA=prueba-mac-1 SUPERVISAR_HOST=mac \
+                TART_CENSO="${TART_CENSO:-}" TART_RC="${TART_RC:-}" TART_RC_CMD="${TART_RC_CMD:-}" \
+                TART_RUN_ESPERA="${TART_RUN_ESPERA:-}" SUPERVISAR_GRACIA="${SUPERVISAR_GRACIA:-90}" \
+                sh "$GITHUB_WORKSPACE/supervisar-macos.sh" \
+                  --slot 1 --cluster prueba --conf "$B/conf.env" \
+                  --montaje "$B/montaje" --latidos "$B/latidos" --estado "$B/estado" \
+                  --golden dorada "$@"
+          }
+
+          # Los verbos de tart, en orden y uno por línea.
+          verbos() { awk '{ print $2 }' "$REG/tart.log"; }
+          BANCO
+
+      # El orden del ciclo NO es cosmético: `set` después de `run` no vira nada (la VM
+      # ya arrancó con los recursos de la golden) y `delete` antes de que `run` retorne
+      # borra una VM encendida. Los dos fallos son silenciosos: el job corre igual, solo
+      # que con la máquina equivocada o con la siguiente vuelta rota.
+      - name: El ciclo va clone -> set -> run -> stop -> delete
+        run: |
+          set -eu
+          . "$RUNNER_TEMP/sup/banco.sh"
+          preparar "$RUNNER_TEMP/sup/orden"
+
+          supervisar --ciclos 1 --limite-job 0 --cpu 4 --memoria 8192 > "$B/salida.log" 2>&1 \
+            || { echo "FALLO: la vuelta salió con error"; cat "$B/salida.log"; exit 1; }
+
+          orden="$(verbos | grep -v '^list$' | tr '\n' ' ')"
+          case "$orden" in
+            "clone set run stop delete "*) : ;;
+            *) echo "FALLO: el ciclo no es clone->set->run->stop->delete sino: $orden"; cat "$REG/tart.log"; exit 1 ;;
+          esac
+          grep -q '^tart clone dorada prueba-mac-1$' "$REG/tart.log" \
+            || { echo "FALLO: se clonó otra cosa (la VM se llama <cluster>-<host>-<slot>)"; cat "$REG/tart.log"; exit 1; }
+          grep -q '^tart set prueba-mac-1 --cpu 4 --memory 8192$' "$REG/tart.log" \
+            || { echo "FALLO: 'tart set' no aplicó cpu y memoria en una sola llamada"; cat "$REG/tart.log"; exit 1; }
+          grep -q -- '--dir=gh-runner:.*:ro' "$REG/tart.log" \
+            || { echo "FALLO: el montaje gh-runner no va en solo lectura; un job podría reescribir el entrypoint de la vuelta siguiente"; exit 1; }
+          grep -q -- '--dir=latidos:' "$REG/tart.log" \
+            || { echo "FALLO: sin el montaje de latidos el invitado no puede publicar su estado"; exit 1; }
+          echo "ok: clone -> set -> run -> stop -> delete, con los dos montajes"
+
+      # El fallo caro de todos: si `tart run` sale mal y el `delete` va colgado del
+      # camino feliz, la VM se queda. Son decenas de GB de un disco de menos de 500 y,
+      # a la vuelta siguiente, `tart clone` falla por nombre duplicado y el slot no
+      # vuelve a arrancar nunca.
+      - name: Una VM no se fuga aunque 'tart run' falle
+        run: |
+          set -eu
+          . "$RUNNER_TEMP/sup/banco.sh"
+          preparar "$RUNNER_TEMP/sup/fuga"
+
+          TART_RC=1 TART_RC_CMD=run supervisar --ciclos 1 --limite-job 0 > "$B/salida.log" 2>&1 \
+            || { echo "FALLO: un 'tart run' fallido no debe tumbar al supervisor"; cat "$B/salida.log"; exit 1; }
+
+          grep -q '^tart delete prueba-mac-1$' "$REG/tart.log" \
+            || { echo "FALLO: 'tart run' falló y la VM se quedó sin borrar"; cat "$REG/tart.log"; exit 1; }
+          grep -q 'DELETE .*/actions/runners/77' "$REG/curl.log" \
+            || { echo "FALLO: tras una vuelta fallida no se limpió el runner fantasma"; cat "$REG/curl.log"; exit 1; }
+          echo "ok: la VM se borra y el fantasma se limpia aunque la vuelta falle"
+
+      # Y tampoco se fuga si el que falla es `tart stop`, que es EL caso: una VM
+      # colgada es justo la que no para con gracia, y es la que hay que borrar sí
+      # o sí. El test de arriba solo tumbaba `run`, así que con `stop` devolviendo
+      # 0 en el banco, encadenar el borrado al éxito del stop
+      # (`tart stop ... && tart delete ...`) pasaba en verde y dejaba 60 GB
+      # colgados en cada VM que no parase. Por eso este caso va aparte.
+      - name: Una VM tampoco se fuga si 'tart stop' falla
+        run: |
+          set -eu
+          . "$RUNNER_TEMP/sup/banco.sh"
+          preparar "$RUNNER_TEMP/sup/fuga-stop"
+
+          TART_RC=1 TART_RC_CMD=stop supervisar --ciclos 1 --limite-job 0 > "$B/salida.log" 2>&1 \
+            || { echo "FALLO: un 'tart stop' fallido no debe tumbar al supervisor"; cat "$B/salida.log"; exit 1; }
+
+          grep -q '^tart delete prueba-mac-1$' "$REG/tart.log" \
+            || { echo "FALLO: 'tart stop' falló y la VM se quedó sin borrar"; cat "$REG/tart.log"; exit 1; }
+          echo "ok: la VM se borra aunque 'tart stop' falle"
+
+      # Lo que la parada elegante NO puede cubrir: un `kill -9`, un pánico o un corte
+      # de luz dejan la VM del slot viva en `tart list` y a nadie que la borre — el
+      # supervisor que la creó ya no existe. Por eso el barrido va AL ARRANCAR, y antes
+      # del primer clone: si fuera después, el `tart clone` chocaría con el nombre.
+      - name: Las VM huérfanas se recogen al arrancar
+        run: |
+          set -eu
+          . "$RUNNER_TEMP/sup/banco.sh"
+          preparar "$RUNNER_TEMP/sup/huerfana"
+
+          TART_CENSO="local prueba-mac-7 60 20 stopped" \
+            supervisar --ciclos 1 --limite-job 0 > "$B/salida.log" 2>&1 || true
+
+          n_h="$(grep -n '^tart delete prueba-mac-7$' "$REG/tart.log" | head -n1 | cut -d: -f1 || true)"
+          n_c="$(grep -n '^tart clone ' "$REG/tart.log" | head -n1 | cut -d: -f1 || true)"
+          [ -n "$n_h" ] \
+            || { echo "FALLO: la VM huérfana del slot 7 sigue ahí; son decenas de GB y un slot bloqueado"; cat "$REG/tart.log"; exit 1; }
+          [ -n "$n_c" ] || { echo "FALLO: no se llegó a clonar"; cat "$REG/tart.log"; exit 1; }
+          [ "$n_h" -lt "$n_c" ] \
+            || { echo "FALLO: el barrido va DESPUÉS del clone; para entonces el nombre ya chocó"; cat "$REG/tart.log"; exit 1; }
+          echo "ok: la huérfana se recoge antes del primer clone"
+
+      # La parada tiene que caber en el ExitTimeOut del plist (120 s) y, sobre todo,
+      # tiene que pedirle al INVITADO que drene: matar el `tart run` de golpe deja el
+      # job a medias y el runner sin desregistrar. Y el paso que no existe en el camino
+      # de Linux es el último: si la VM murió colgada, el invitado nunca se desregistró
+      # y ese runner `offline` contaría como caído para siempre.
+      - name: SIGTERM drena por ssh, derriba la VM y limpia el runner en GitHub
+        run: |
+          set -eu
+          . "$RUNNER_TEMP/sup/banco.sh"
+          preparar "$RUNNER_TEMP/sup/parada"
+
+          export TART_RUN_ESPERA=1 SUPERVISAR_GRACIA=10
+          supervisar --limite-job 0 > "$B/salida.log" 2>&1 &
+          espera=$!
+
+          i=0
+          while [ "$i" -lt 200 ] && ! grep -q '^tart run ' "$REG/tart.log" 2>/dev/null; do sleep 0.1; i=$((i+1)); done
+          grep -q '^tart run ' "$REG/tart.log" || { echo "FALLO: la VM no llegó a arrancar"; cat "$B/salida.log"; exit 1; }
+
+          # El PID sale del fichero que el propio supervisor publica: es el mismo que
+          # usa el barrido de huérfanas para saber si un slot tiene dueño vivo.
+          sup="$(cat "$B/estado/runner-1/supervisor.pid")"
+          kill -TERM "$sup"
+          rc=0; wait "$espera" || rc=$?
+
+          grep -q 'pkill -TERM -f entrypoint-macos.sh' "$REG/ssh.log" \
+            || { echo "FALLO: no se le pidió al invitado que drenara; el job muere a medias"; cat "$REG/ssh.log"; exit 1; }
+          n_s="$(grep -n '^tart stop prueba-mac-1$'   "$REG/tart.log" | head -n1 | cut -d: -f1 || true)"
+          n_d="$(grep -n '^tart delete prueba-mac-1$' "$REG/tart.log" | head -n1 | cut -d: -f1 || true)"
+          { [ -n "$n_s" ] && [ -n "$n_d" ] && [ "$n_s" -lt "$n_d" ]; } \
+            || { echo "FALLO: la parada no hizo stop y luego delete"; cat "$REG/tart.log"; exit 1; }
+          grep -q 'DELETE .*/actions/runners/77' "$REG/curl.log" \
+            || { echo "FALLO: no se borró el runner por API; quedaría un fantasma offline que el vigía cuenta como caído para siempre"; cat "$REG/curl.log"; exit 1; }
+          [ ! -f "$B/estado/runner-1/supervisor.pid" ] \
+            || { echo "FALLO: quedó el pidfile; el barrido de la próxima vez creería que el slot tiene dueño"; exit 1; }
+          [ "$rc" -eq 0 ] || { echo "FALLO: la parada no salió con 0 (rc=$rc); launchd lo leería como caída"; exit 1; }
+          echo "ok: ssh -> stop -> delete -> DELETE del runner, y salida limpia"
+
+      # El PAT es el secreto del despliegue y una línea de comandos la ve cualquiera
+      # con `ps` en la máquina — incluido un job de un PR de terceros. Va por cabecera
+      # de curl y por el montaje, nunca en el argv de tart ni de ssh. Se auditan los
+      # registros de la parada elegante, que es la vuelta que MÁS herramientas invoca.
+      - name: El PAT no aparece en ningún argv de tart ni de ssh
+        run: |
+          set -eu
+          REG="$RUNNER_TEMP/sup/parada/reg"
+          [ -s "$REG/tart.log" ] || { echo "FALLO: no hay registro de tart que auditar"; exit 1; }
+          [ -s "$REG/ssh.log" ]  || { echo "FALLO: no hay registro de ssh que auditar"; exit 1; }
+          if grep -q 'PAT-SECRETO-abc123' "$REG/tart.log" "$REG/ssh.log"; then
+            echo "FALLO: el PAT viaja en una línea de comandos; cualquier 'ps' en la máquina lo lee"
+            grep -n 'PAT-SECRETO-abc123' "$REG/tart.log" "$REG/ssh.log" || true
+            exit 1
+          fi
+          echo "ok: el PAT no está en el argv de tart ni de ssh"
+
+      # El backoff es lo que protege el rate limit del PAT: cada vuelta mintea un
+      # registration-token, así que un crash-loop sin freno agota la cuota y el fleet
+      # ENTERO deja de poder registrar runners. Aquí se fijan sus dos mitades: que la
+      # espera crece, y dónde está el umbral de "vuelta sana".
+      - name: El backoff crece, y una vuelta corta cuenta como fallo
+        run: |
+          set -eu
+          . "$RUNNER_TEMP/sup/banco.sh"
+
+          # (a) Dos fallos seguidos esperan más que uno. Sin crecimiento, un slot roto
+          # martillea la API cada 15 s indefinidamente.
+          preparar "$RUNNER_TEMP/sup/backoff"; stub_sleep
+          supervisar --ciclos 3 --limite-job 0 > "$B/salida.log" 2>&1 || true
+          esperas="$(sed -n 's/.*esperando \([0-9]\{1,\}\)s.*/\1/p' "$B/salida.log")"
+          n="$(printf '%s\n' "$esperas" | grep -c '[0-9]' || true)"
+          [ "$n" -ge 2 ] \
+            || { echo "FALLO: dos vueltas fallidas seguidas no aplicaron backoff dos veces"; cat "$B/salida.log"; exit 1; }
+          e1="$(printf '%s\n' "$esperas" | sed -n 1p)"
+          e2="$(printf '%s\n' "$esperas" | sed -n 2p)"
+          [ "$e2" -gt "$e1" ] \
+            || { echo "FALLO: la segunda espera (${e2}s) no es mayor que la primera (${e1}s)"; cat "$B/salida.log"; exit 1; }
+
+          # (b) Una vuelta de 25 s es un FALLO, no un job corto: en macOS una vuelta
+          # sana incluye arrancar la VM (~30-45 s), así que con el umbral de 20 s que
+          # usa Linux un crash-loop de VM que no arranca pasaría por trabajo normal y
+          # no frenaría nunca.
+          preparar "$RUNNER_TEMP/sup/corto"; stub_sleep
+          mkdir -p "$B/estado/runner-1"
+          expr "$(date +%s)" - 25 > "$B/estado/runner-1/.gh_runner_last"
+          supervisar --ciclos 1 --limite-job 0 > "$B/salida.log" 2>&1 || true
+          grep -q 'Fallo rápido (#1, vuelta previa 25s' "$B/salida.log" \
+            || { echo "FALLO: una vuelta de 25s no se contó como fallo; el umbral sano en macOS son 90s, no los 20 de Linux"; cat "$B/salida.log"; exit 1; }
+          echo "ok: el backoff crece y el umbral sano son 90s"
+
+      # Entre vuelta y vuelta hay 60-90 s sin VM (clone y boot por delante, stop y
+      # delete por detrás) y VIGIA_RANCIO son 120 s. Si nadie escribe el latido en ese
+      # hueco, el vigía da por CAÍDO a un slot sano en cada rotación y el aviso se
+      # vuelve ruido que se acaba ignorando.
+      - name: El supervisor late 'arrancando' mientras no hay VM
+        run: |
+          set -eu
+          . "$RUNNER_TEMP/sup/banco.sh"
+          preparar "$RUNNER_TEMP/sup/latido"
+
+          supervisar --ciclos 1 --limite-job 0 > "$B/salida.log" 2>&1 || true
+
+          # El nombre del fichero es el mismo nombre único: VM, runner y latido.
+          lat="$B/latidos/prueba-mac-1"
+          [ -f "$lat" ] \
+            || { echo "FALLO: nadie escribió el latido en el hueco sin VM; el vigía daría el slot por caído en cada rotación"; ls -la "$B/latidos"; exit 1; }
+          estado="$(awk '{ print $2 }' "$lat")"
+          [ "$estado" = "arrancando" ] \
+            || { echo "FALLO: el latido dice '$estado' y no 'arrancando'"; cat "$lat"; exit 1; }
+          # Mismo formato que latido.sh: epoch, estado, ocupado/libre, disco, último job, motivo.
+          campos="$(awk '{ print NF }' "$lat")"
+          [ "$campos" -ge 5 ] || { echo "FALLO: la línea de latido no sigue el formato de latido.sh"; cat "$lat"; exit 1; }
+          echo "ok: el hueco sin VM queda cubierto por el latido del supervisor"
+
   smoke:
     runs-on: ubuntu-latest
     steps:
